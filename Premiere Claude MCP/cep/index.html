@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Claude Bridge</title>
+  <style>
+    body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; background: #232323; color: #ccc; margin: 0; padding: 10px; font-size: 12px; }
+    #status { padding: 8px 10px; border-radius: 4px; margin-bottom: 8px; font-weight: 600; }
+    .ok { background: #1d3b1f; color: #7ed083; }
+    .bad { background: #3b1d1d; color: #f08a80; }
+    .wait { background: #3b351d; color: #f0c674; }
+    #meta { color: #999; margin-bottom: 8px; line-height: 1.5; }
+    #log { background: #161616; border: 1px solid #333; border-radius: 4px; padding: 6px 8px; height: 96px; overflow-y: auto; font-family: Menlo, monospace; font-size: 11px; white-space: pre-wrap; }
+    button { background: #3a3a3a; color: #ddd; border: 1px solid #555; padding: 4px 10px; border-radius: 3px; cursor: pointer; margin-top: 8px; margin-right: 6px; }
+    button:hover { background: #4a4a4a; }
+  </style>
+</head>
+<body>
+  <div id="status" class="wait">Starting…</div>
+  <div id="meta"></div>
+  <div id="log"></div>
+  <button onclick="PANEL.reloadHost()">Reload host script</button>
+  <button onclick="PANEL.restartServer()">Restart server</button>
+  <script src="js/CSInterface.js"></script>
+  <script src="js/panel.js"></script>
+</body>
+</html>

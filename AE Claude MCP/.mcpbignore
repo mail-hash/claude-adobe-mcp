@@ -1,0 +1,6 @@
+/dist/
+/build.sh
+/test/
+/README.md
+*.log
+.DS_Store

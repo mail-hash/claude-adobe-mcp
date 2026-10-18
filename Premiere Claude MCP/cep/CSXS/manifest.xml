@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ExtensionManifest xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   Version="7.0"
+                   ExtensionBundleId="com.chrismorris.claude-premiere-bridge"
+                   ExtensionBundleName="Claude Premiere Bridge"
+                   ExtensionBundleVersion="1.0.0">
+
+  <ExtensionList>
+    <Extension Id="com.chrismorris.claude-premiere-bridge.panel" Version="1.0.0" />
+  </ExtensionList>
+
+  <ExecutionEnvironment>
+    <HostList>
+      <!-- Premiere Pro 2023 (23.x) through 2026 (26.x) and later. Premiere 26 ships CEP 12. -->
+      <Host Name="PPRO" Version="[23.0,99.9]" />
+    </HostList>
+    <LocaleList>
+      <Locale Code="All" />
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="12.0" />
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+
+  <DispatchInfoList>
+    <Extension Id="com.chrismorris.claude-premiere-bridge.panel">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./index.html</MainPath>
+          <!-- No ScriptPath on purpose: a failing ScriptPath poisons the ExtendScript engine for the
+               whole session. The panel loads jsx/host.jsx itself from an absolute path. -->
+          <CEFCommandLine>
+            <Parameter>--enable-nodejs</Parameter>
+            <Parameter>--mixed-context</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>Claude Bridge</Menu>
+          <Geometry>
+            <Size>
+              <Height>220</Height>
+              <Width>320</Width>
+            </Size>
+            <MinSize>
+              <Height>120</Height>
+              <Width>220</Width>
+            </MinSize>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

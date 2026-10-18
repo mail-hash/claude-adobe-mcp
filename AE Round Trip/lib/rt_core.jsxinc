@@ -1,0 +1,1079 @@
+// AE Round Trip — shared core (ExtendScript / ES3).
+// #include'd INSIDE each script's function scope, so RT is local to that run: nothing is left in
+// After Effects' shared engine, and no built-in prototype is ever modified.
+
+var RT = {};
+RT.FORMAT = "ae-roundtrip";
+RT.FORMAT_VERSION = 1;
+RT.TAG_RE = /\s*\[rtid:([A-Za-z0-9_\-]+)\]/;
+RT.EPS = 1e-6;
+
+// ---------------------------------------------------------------------------
+// Small ES3 helpers
+// ---------------------------------------------------------------------------
+
+RT.isArray = function (v) { return Object.prototype.toString.call(v) === "[object Array]"; };
+RT.has = function (o, k) { return o !== null && o !== undefined && Object.prototype.hasOwnProperty.call(o, k); };
+RT.keys = function (o) { var r = []; for (var k in o) { if (RT.has(o, k)) r.push(k); } return r; };
+RT.indexOf = function (arr, v) { for (var i = 0; i < arr.length; i++) { if (arr[i] === v) return i; } return -1; };
+
+RT.round = function (n) {
+    if (typeof n !== "number" || !isFinite(n)) return n;
+    var r = Math.round(n * 1e6) / 1e6;
+    return (r === 0) ? 0 : r; // no -0
+};
+
+// "HH:MM:SS:FF" (drop-frame ';' for 29.97 / 59.94).
+RT.timecode = function (seconds, fps) {
+    fps = fps || 30;
+    var drop = Math.abs(fps - 29.97) < 0.01 || Math.abs(fps - 59.94) < 0.01, rf = Math.round(fps);
+    var total = Math.round(seconds * fps), f = total % rf, s = Math.floor(total / rf);
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    function p(n) { return (n < 10 ? "0" : "") + n; }
+    return p(h) + ":" + p(m) + ":" + p(sec) + (drop ? ";" : ":") + p(f);
+};
+RT.timeInfo = function (seconds, fps) { return { seconds: RT.round(seconds), frames: Math.round(seconds * fps), timecode: RT.timecode(seconds, fps) }; };
+
+RT.roundAll = function (v) {
+    if (typeof v === "number") return RT.round(v);
+    if (RT.isArray(v)) { var r = []; for (var i = 0; i < v.length; i++) r.push(RT.roundAll(v[i])); return r; }
+    return v;
+};
+
+// Deep equality with numeric tolerance; key order does not matter.
+RT.equal = function (a, b) {
+    if (a === b) return true;
+    if (typeof a === "number" && typeof b === "number") {
+        var d = Math.abs(a - b);
+        return d <= RT.EPS || d <= RT.EPS * Math.max(Math.abs(a), Math.abs(b));
+    }
+    if (a === null || b === null || a === undefined || b === undefined) return false;
+    if (typeof a !== "object" || typeof b !== "object") return false;
+    if (RT.isArray(a) !== RT.isArray(b)) return false;
+    if (RT.isArray(a)) {
+        if (a.length !== b.length) return false;
+        for (var i = 0; i < a.length; i++) { if (!RT.equal(a[i], b[i])) return false; }
+        return true;
+    }
+    var k;
+    for (k in a) { if (RT.has(a, k) && !RT.equal(a[k], b[k])) return false; }
+    for (k in b) { if (RT.has(b, k) && !RT.has(a, k) && b[k] !== undefined) return false; }
+    return true;
+};
+
+RT.enumName = function (enumObj, val) {
+    for (var k in enumObj) { try { if (enumObj[k] === val) return k; } catch (e) {} }
+    return val;
+};
+
+RT.enumVal = function (enumObj, name) {
+    if (typeof name === "number") return name;
+    if (name === null || name === undefined) return undefined;
+    var v = enumObj[name];
+    if (v === undefined) throw new Error("Unknown enum value '" + name + "'");
+    return v;
+};
+
+// ---------------------------------------------------------------------------
+// JSON (pretty printer that keeps small primitive arrays on one line)
+// ---------------------------------------------------------------------------
+
+RT.quote = function (s) {
+    return '"' + String(s).replace(/[\\"\u0000-\u001f\u2028\u2029]/g, function (c) {
+        switch (c) {
+            case '"': return '\\"';
+            case "\\": return "\\\\";
+            case "\n": return "\\n";
+            case "\r": return "\\r";
+            case "\t": return "\\t";
+            case "\b": return "\\b";
+            case "\f": return "\\f";
+        }
+        var h = c.charCodeAt(0).toString(16);
+        while (h.length < 4) h = "0" + h;
+        return "\\u" + h;
+    }) + '"';
+};
+
+RT.stringify = function (v, indent) {
+    indent = indent || "";
+    if (v === null || v === undefined) return "null";
+    var t = typeof v;
+    if (t === "number") return isFinite(v) ? String(v) : "null";
+    if (t === "boolean") return v ? "true" : "false";
+    if (t === "string") return RT.quote(v);
+    var inner = indent + "  ", parts = [], i;
+    if (RT.isArray(v)) {
+        if (v.length === 0) return "[]";
+        var flat = true;
+        for (i = 0; i < v.length; i++) {
+            if (v[i] !== null && typeof v[i] === "object") {
+                // arrays of short numeric arrays (shape vertices) stay compact too
+                if (!(RT.isArray(v[i]) && v[i].length <= 4 && RT._allPrim(v[i]))) { flat = false; break; }
+            }
+        }
+        for (i = 0; i < v.length; i++) parts.push(RT.stringify(v[i], inner));
+        if (flat) {
+            var line = "[" + parts.join(", ") + "]";
+            if (line.length <= 200) return line;
+        }
+        return "[\n" + inner + parts.join(",\n" + inner) + "\n" + indent + "]";
+    }
+    for (var k in v) {
+        if (!RT.has(v, k) || v[k] === undefined || typeof v[k] === "function") continue;
+        parts.push(RT.quote(k) + ": " + RT.stringify(v[k], inner));
+    }
+    if (parts.length === 0) return "{}";
+    return "{\n" + inner + parts.join(",\n" + inner) + "\n" + indent + "}";
+};
+
+RT._allPrim = function (a) {
+    for (var i = 0; i < a.length; i++) { if (a[i] !== null && typeof a[i] === "object") return false; }
+    return true;
+};
+
+// Strict recursive-descent parser (does not eval user files).
+RT.parse = function (src) {
+    var i = 0, len = src.length;
+    function err(m) { throw new Error("JSON parse error at char " + i + ": " + m); }
+    function ws() { while (i < len) { var c = src.charAt(i); if (c === " " || c === "\n" || c === "\r" || c === "\t") i++; else break; } }
+    function str() {
+        var out = "", c;
+        i++; // opening quote
+        while (i < len) {
+            c = src.charAt(i++);
+            if (c === '"') return out;
+            if (c === "\\") {
+                c = src.charAt(i++);
+                if (c === "n") out += "\n"; else if (c === "r") out += "\r"; else if (c === "t") out += "\t";
+                else if (c === "b") out += "\b"; else if (c === "f") out += "\f";
+                else if (c === "u") { out += String.fromCharCode(parseInt(src.substr(i, 4), 16)); i += 4; }
+                else out += c;
+            } else out += c;
+        }
+        err("unterminated string");
+    }
+    function num() {
+        var m = /^-?\d+(\.\d+)?([eE][+\-]?\d+)?/.exec(src.substr(i, 64));
+        if (!m) err("bad number");
+        i += m[0].length;
+        return parseFloat(m[0]);
+    }
+    function val() {
+        ws();
+        var c = src.charAt(i);
+        if (c === "{") {
+            i++; var o = {}; ws();
+            if (src.charAt(i) === "}") { i++; return o; }
+            while (true) {
+                ws(); if (src.charAt(i) !== '"') err("expected key");
+                var k = str(); ws();
+                if (src.charAt(i++) !== ":") err("expected ':'");
+                o[k] = val(); ws();
+                c = src.charAt(i++);
+                if (c === "}") return o;
+                if (c !== ",") err("expected ',' or '}'");
+            }
+        }
+        if (c === "[") {
+            i++; var a = []; ws();
+            if (src.charAt(i) === "]") { i++; return a; }
+            while (true) {
+                a.push(val()); ws();
+                c = src.charAt(i++);
+                if (c === "]") return a;
+                if (c !== ",") err("expected ',' or ']'");
+            }
+        }
+        if (c === '"') return str();
+        if (src.substr(i, 4) === "true") { i += 4; return true; }
+        if (src.substr(i, 5) === "false") { i += 5; return false; }
+        if (src.substr(i, 4) === "null") { i += 4; return null; }
+        return num();
+    }
+    var r = val(); ws();
+    if (i < len) err("trailing characters");
+    return r;
+};
+
+// ---------------------------------------------------------------------------
+// File IO
+// ---------------------------------------------------------------------------
+
+RT.writeText = function (path, text) {
+    var f = (path instanceof File) ? path : new File(path);
+    f.encoding = "UTF-8";
+    f.lineFeed = "Unix";
+    if (!f.open("w")) throw new Error("Cannot write " + f.fsName + " (enable Preferences > Scripting & Expressions > Allow Scripts to Write Files and Access Network)");
+    f.write(text);
+    f.close();
+    return f;
+};
+
+RT.readText = function (path) {
+    var f = (path instanceof File) ? path : new File(path);
+    if (!f.exists) throw new Error("File not found: " + f.fsName);
+    f.encoding = "UTF-8";
+    f.open("r");
+    var s = f.read();
+    f.close();
+    if (s.charCodeAt(0) === 0xFEFF) s = s.substr(1);
+    return s;
+};
+
+RT.readJSON = function (path) { return RT.parse(RT.readText(path)); };
+RT.writeJSON = function (path, obj) { return RT.writeText(path, RT.stringify(obj) + "\n"); };
+
+// Baseline sidecar: written by Export, used by Apply to find what you changed.
+RT.basePathFor = function (jsonPath) {
+    var p = (jsonPath instanceof File) ? jsonPath.fsName : String(jsonPath);
+    return p.replace(/\.json$/i, "") + ".rtbase.json";
+};
+
+// Headless args (set by the osascript runner) — consumed once.
+RT.takeArgs = function () {
+    var a = null;
+    try { a = $.global.RT_ARGS || null; delete $.global.RT_ARGS; } catch (e) {}
+    return a;
+};
+
+// ---------------------------------------------------------------------------
+// Stable IDs in comments
+// ---------------------------------------------------------------------------
+
+RT.newId = function (prefix) {
+    var s = "";
+    var chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+    for (var i = 0; i < 8; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+    return prefix + "-" + s;
+};
+
+RT.readTag = function (comment) {
+    var m = RT.TAG_RE.exec(comment || "");
+    return m ? m[1] : null;
+};
+
+RT.stripTag = function (comment) {
+    return String(comment || "").replace(RT.TAG_RE, "");
+};
+
+RT.withTag = function (userComment, id) {
+    var c = RT.stripTag(userComment);
+    return (c.length ? c + " " : "") + "[rtid:" + id + "]";
+};
+
+// Ensure obj (Layer or CompItem) carries an ID unique within `seen`. Returns the ID.
+RT.ensureId = function (obj, prefix, seen) {
+    var id = RT.readTag(obj.comment);
+    if (!id || seen[id]) {
+        do { id = RT.newId(prefix); } while (seen[id]);
+        var locked = false;
+        try { locked = obj.locked === true; if (locked) obj.locked = false; } catch (e) {}
+        obj.comment = RT.withTag(obj.comment, id);
+        if (locked) obj.locked = true;
+    }
+    seen[id] = true;
+    return id;
+};
+
+RT.findLayerById = function (comp, id) {
+    for (var i = 1; i <= comp.numLayers; i++) {
+        if (RT.readTag(comp.layer(i).comment) === id) return comp.layer(i);
+    }
+    return null;
+};
+
+RT.findItemById = function (aeId) {
+    try { return app.project.itemByID(aeId); } catch (e) {}
+    for (var i = 1; i <= app.project.numItems; i++) { if (app.project.item(i).id === aeId) return app.project.item(i); }
+    return null;
+};
+
+RT.findCompByName = function (name) {
+    for (var i = 1; i <= app.project.numItems; i++) {
+        var it = app.project.item(i);
+        if (it instanceof CompItem && it.name === name) return it;
+    }
+    return null;
+};
+
+// ---------------------------------------------------------------------------
+// Layer typing
+// ---------------------------------------------------------------------------
+
+RT.layerType = function (L) {
+    var mn = L.matchName;
+    if (mn === "ADBE Text Layer") return "text";
+    if (mn === "ADBE Vector Layer") return "shape";
+    if (mn === "ADBE Camera Layer") return "camera";
+    if (mn === "ADBE Light Layer") return "light";
+    var src = null;
+    try { src = L.source; } catch (e) {}
+    if (L.nullLayer) return "null";
+    if (src instanceof CompItem) return "precomp";
+    if (src && src.mainSource instanceof SolidSource) return L.adjustmentLayer ? "adjustment" : "solid";
+    return "footage";
+};
+
+// ---------------------------------------------------------------------------
+// Value (de)serialization
+// ---------------------------------------------------------------------------
+
+RT.TEXT_FIELDS = [
+    "font", "fontSize", "applyFill", "fillColor", "applyStroke", "strokeColor", "strokeWidth", "strokeOverFill",
+    "justification", "tracking", "leading", "autoLeading", "baselineShift", "horizontalScale", "verticalScale",
+    "fauxBold", "fauxItalic", "allCaps", "smallCaps", "superscript", "subscript", "tsume", "boxTextSize"
+];
+
+RT.serTextDoc = function (td) {
+    var o = { text: td.text };
+    try { o.boxText = td.boxText; } catch (e) {}
+    for (var i = 0; i < RT.TEXT_FIELDS.length; i++) {
+        var f = RT.TEXT_FIELDS[i];
+        if (f === "fillColor" && o.applyFill === false) continue;
+        if ((f === "strokeColor" || f === "strokeWidth" || f === "strokeOverFill") && o.applyStroke !== true) continue;
+        if (f === "boxTextSize" && !o.boxText) continue;
+        if (f === "leading" && o.autoLeading === true) continue;
+        try {
+            var v = td[f];
+            if (v === undefined) continue;
+            if (f === "justification") v = RT.enumName(ParagraphJustification, v);
+            o[f] = RT.roundAll(v);
+        } catch (e) {}
+    }
+    return o;
+};
+
+RT.applyTextDoc = function (td, o) {
+    if (RT.has(o, "text")) td.text = o.text;
+    for (var i = 0; i < RT.TEXT_FIELDS.length; i++) {
+        var f = RT.TEXT_FIELDS[i];
+        if (!RT.has(o, f)) continue;
+        try {
+            td[f] = (f === "justification") ? RT.enumVal(ParagraphJustification, o[f]) : o[f];
+        } catch (e) {}
+    }
+    return td;
+};
+
+RT.MARKER_FIELDS = ["comment", "duration", "chapter", "url", "frameTarget", "cuePointName", "eventCuePoint", "label", "protectedRegion"];
+
+RT.serMarker = function (mv) {
+    var o = {};
+    for (var i = 0; i < RT.MARKER_FIELDS.length; i++) {
+        try { var v = mv[RT.MARKER_FIELDS[i]]; if (v !== undefined && v !== "" ) o[RT.MARKER_FIELDS[i]] = RT.roundAll(v); } catch (e) {}
+    }
+    try { var p = mv.getParameters(); var pk = RT.keys(p); if (pk.length) o.params = p; } catch (e) {}
+    return o;
+};
+
+RT.makeMarker = function (o) {
+    var mv = new MarkerValue(o.comment || "");
+    for (var i = 0; i < RT.MARKER_FIELDS.length; i++) {
+        var f = RT.MARKER_FIELDS[i];
+        if (f !== "comment" && RT.has(o, f)) { try { mv[f] = o[f]; } catch (e) {} }
+    }
+    if (o.params) { try { mv.setParameters(o.params); } catch (e) {} }
+    return mv;
+};
+
+RT.SHAPE_FEATHER = ["featherSegLocs", "featherRelSegLocs", "featherRadii", "featherInterps", "featherTensions", "featherTypes", "featherRelCornerAngles"];
+
+RT.serShape = function (s) {
+    var o = { closed: s.closed, vertices: RT.roundAll(s.vertices), inTangents: RT.roundAll(s.inTangents), outTangents: RT.roundAll(s.outTangents) };
+    try {
+        if (s.featherSegLocs && s.featherSegLocs.length) {
+            for (var i = 0; i < RT.SHAPE_FEATHER.length; i++) o[RT.SHAPE_FEATHER[i]] = RT.roundAll(s[RT.SHAPE_FEATHER[i]]);
+        }
+    } catch (e) {}
+    return o;
+};
+
+RT.makeShape = function (o) {
+    var s = new Shape();
+    s.vertices = o.vertices; s.inTangents = o.inTangents; s.outTangents = o.outTangents; s.closed = o.closed;
+    if (o.featherSegLocs) {
+        for (var i = 0; i < RT.SHAPE_FEATHER.length; i++) { if (o[RT.SHAPE_FEATHER[i]]) s[RT.SHAPE_FEATHER[i]] = o[RT.SHAPE_FEATHER[i]]; }
+    }
+    return s;
+};
+
+RT.serValue = function (prop, v) {
+    var t = prop.propertyValueType;
+    if (t === PropertyValueType.SHAPE) return RT.serShape(v);
+    if (t === PropertyValueType.TEXT_DOCUMENT) return RT.serTextDoc(v);
+    if (t === PropertyValueType.MARKER) return RT.serMarker(v);
+    return RT.roundAll(v);
+};
+
+// `base` is an existing value to modify (needed for TextDocument).
+RT.deserValue = function (prop, o, base) {
+    var t = prop.propertyValueType;
+    if (t === PropertyValueType.SHAPE) return RT.makeShape(o);
+    if (t === PropertyValueType.MARKER) return RT.makeMarker(o);
+    if (t === PropertyValueType.TEXT_DOCUMENT) {
+        var td = base;
+        if (!td) { try { td = prop.valueAtTime(0, true); } catch (e) { td = new TextDocument(o.text || ""); } }
+        return RT.applyTextDoc(td, o);
+    }
+    return o;
+};
+
+// ---------------------------------------------------------------------------
+// Keyframes
+// ---------------------------------------------------------------------------
+
+RT.INTERP = { linear: "LINEAR", bezier: "BEZIER", hold: "HOLD" };
+
+RT.interpName = function (v) {
+    if (v === KeyframeInterpolationType.LINEAR) return "linear";
+    if (v === KeyframeInterpolationType.HOLD) return "hold";
+    return "bezier";
+};
+
+RT.canEase = function (prop) {
+    var t = prop.propertyValueType;
+    if (t === PropertyValueType.MARKER || t === PropertyValueType.TEXT_DOCUMENT || t === PropertyValueType.LAYER_INDEX || t === PropertyValueType.MASK_INDEX) return false;
+    try { return prop.isInterpolationTypeValid(KeyframeInterpolationType.BEZIER); } catch (e) { return false; }
+};
+
+RT.serEase = function (arr) {
+    var r = [];
+    for (var i = 0; i < arr.length; i++) r.push({ speed: RT.round(arr[i].speed), influence: RT.round(arr[i].influence) });
+    return r;
+};
+
+RT.serKey = function (prop, i) {
+    var k = { t: prop.keyTime(i), v: RT.serValue(prop, prop.keyValue(i)) };
+    try {
+        k.inInterp = RT.interpName(prop.keyInInterpolationType(i));
+        k.outInterp = RT.interpName(prop.keyOutInterpolationType(i));
+    } catch (e) {}
+    if (RT.canEase(prop)) {
+        try {
+            k.inEase = RT.serEase(prop.keyInTemporalEase(i));
+            k.outEase = RT.serEase(prop.keyOutTemporalEase(i));
+            k.temporalContinuous = prop.keyTemporalContinuous(i);
+            k.temporalAutoBezier = prop.keyTemporalAutoBezier(i);
+        } catch (e) {}
+    }
+    if (prop.isSpatial) {
+        try {
+            k.inTangent = RT.roundAll(prop.keyInSpatialTangent(i));
+            k.outTangent = RT.roundAll(prop.keyOutSpatialTangent(i));
+            k.spatialContinuous = prop.keySpatialContinuous(i);
+            k.spatialAutoBezier = prop.keySpatialAutoBezier(i);
+            k.roving = prop.keyRoving(i);
+        } catch (e) {}
+    }
+    try { var lab = prop.keyLabel(i); if (lab) k.label = lab; } catch (e) {}
+    return k;
+};
+
+RT.KEY_ATTRS = ["inInterp", "outInterp", "inEase", "outEase", "temporalContinuous", "temporalAutoBezier",
+    "inTangent", "outTangent", "spatialContinuous", "spatialAutoBezier", "roving", "label"];
+
+RT.makeEase = function (arr) {
+    var r = [];
+    for (var i = 0; i < arr.length; i++) {
+        var inf = Math.max(0.1, Math.min(100, arr[i].influence));
+        r.push(new KeyframeEase(arr[i].speed, inf));
+    }
+    return r;
+};
+
+// Apply interpolation / easing / spatial attributes to key `i`. `warn(msg)` collects problems.
+RT.applyKeyAttrs = function (prop, i, k, warn) {
+    function tryDo(what, fn) { try { fn(); } catch (e) { warn(prop.name + " key " + i + " " + what + ": " + e.message); } }
+    if (RT.has(k, "label")) tryDo("label", function () { prop.setLabelAtKey(i, k.label); });
+    // Setting temporal ease forces BEZIER, so ease goes first and interpolation type last.
+    if (RT.canEase(prop)) {
+        if (k.inEase && k.outEase) tryDo("temporal ease", function () { prop.setTemporalEaseAtKey(i, RT.makeEase(k.inEase), RT.makeEase(k.outEase)); });
+        if (RT.has(k, "temporalContinuous")) tryDo("temporal continuous", function () { prop.setTemporalContinuousAtKey(i, k.temporalContinuous); });
+        if (RT.has(k, "temporalAutoBezier")) tryDo("temporal auto-bezier", function () { prop.setTemporalAutoBezierAtKey(i, k.temporalAutoBezier); });
+    }
+    if (k.inInterp || k.outInterp) {
+        var ii = KeyframeInterpolationType[RT.INTERP[k.inInterp || "linear"]];
+        var oi = KeyframeInterpolationType[RT.INTERP[k.outInterp || k.inInterp || "linear"]];
+        if (prop.isInterpolationTypeValid(ii) && prop.isInterpolationTypeValid(oi)) {
+            tryDo("interpolation", function () { prop.setInterpolationTypeAtKey(i, ii, oi); });
+        }
+    }
+    if (prop.isSpatial) {
+        if (RT.has(k, "spatialContinuous")) tryDo("spatial continuous", function () { prop.setSpatialContinuousAtKey(i, k.spatialContinuous); });
+        if (RT.has(k, "spatialAutoBezier")) tryDo("spatial auto-bezier", function () { prop.setSpatialAutoBezierAtKey(i, k.spatialAutoBezier); });
+        if (k.inTangent && k.outTangent && !k.spatialAutoBezier) tryDo("spatial tangents", function () { prop.setSpatialTangentsAtKey(i, k.inTangent, k.outTangent); });
+        if (k.roving) tryDo("roving", function () { prop.setRovingAtKey(i, true); });
+    }
+};
+
+RT.removeAllKeys = function (prop) {
+    for (var i = prop.numKeys; i >= 1; i--) prop.removeKey(i);
+};
+
+// Replace every key on `prop` with `keys` (array of serialized keys).
+RT.setAllKeys = function (prop, keys, warn) {
+    // New keys go in before old ones come out: removing every key from some properties
+    // (Time Remap) switches the feature off and hides the property.
+    var i, idx = [], old = [];
+    for (i = 1; i <= prop.numKeys; i++) old.push(prop.keyTime(i));
+    for (i = 0; i < keys.length; i++) {
+        var base = (prop.propertyValueType === PropertyValueType.TEXT_DOCUMENT) ? prop.valueAtTime(keys[i].t, true) : null;
+        prop.setValueAtTime(keys[i].t, RT.deserValue(prop, keys[i].v, base));
+    }
+    for (i = old.length - 1; i >= 0; i--) {
+        var keep = false;
+        for (var j = 0; j < keys.length; j++) if (Math.abs(keys[j].t - old[i]) < 1e-6) keep = true;
+        if (!keep) { var ki = prop.nearestKeyIndex(old[i]); if (Math.abs(prop.keyTime(ki) - old[i]) < 1e-6) prop.removeKey(ki); }
+    }
+    for (i = 0; i < keys.length; i++) idx.push(prop.nearestKeyIndex(keys[i].t));
+    // Interpolation before spatial attrs on every key, then attrs — neighbours affect auto-bezier.
+    for (i = 0; i < keys.length; i++) RT.applyKeyAttrs(prop, idx[i], keys[i], warn);
+};
+
+// ---------------------------------------------------------------------------
+// Property tree serialization
+// ---------------------------------------------------------------------------
+
+// Groups never exported (UI-only / not settable / not reproducible by script).
+RT.SKIP_GROUPS = { "ADBE Layer Overrides": true, "ADBE Data Group": true };
+
+// Transform leaves always written (even at default) so the JSON is easy to edit.
+RT.ALWAYS_TRANSFORM = { "ADBE Anchor Point": true, "ADBE Position": true, "ADBE Scale": true, "ADBE Rotate Z": true, "ADBE Opacity": true };
+
+RT.isGroup = function (p) { return p.propertyType !== PropertyType.PROPERTY; };
+
+RT.serLeaf = function (p, parent) {
+    var t = p.propertyValueType;
+    if (t === PropertyValueType.NO_VALUE || t === PropertyValueType.CUSTOM_VALUE) return null;
+
+    // Separated dimensions: followers only matter when the leader is separated.
+    var leaderSeparated = false, followerActive = false;
+    try { if (p.isSeparationLeader) leaderSeparated = p.dimensionsSeparated; } catch (e) {}
+    try { if (p.isSeparationFollower) { followerActive = p.separationLeader.dimensionsSeparated; if (!followerActive) return null; } } catch (e) {}
+
+    var numKeys = 0, expr = "", exprOn = false, modified = false;
+    try { numKeys = p.numKeys; } catch (e) {}
+    try { if (p.canSetExpression) { expr = p.expression; exprOn = p.expressionEnabled; } } catch (e) {}
+    try { modified = p.isModified; } catch (e) {}
+
+    var force = false;
+    var pmn = parent ? parent.matchName : "";
+    if (pmn === "ADBE Transform Group" && RT.ALWAYS_TRANSFORM[p.matchName]) {
+        // cameras and lights have no Scale / Opacity / Anchor Point (they're hidden)
+        var lmn = ""; try { lmn = p.propertyGroup(p.propertyDepth).matchName; } catch (e) {}
+        force = lmn !== "ADBE Camera Layer" && lmn !== "ADBE Light Layer";
+    }
+    if (p.matchName === "ADBE Text Document") force = true;
+    if (pmn === "ADBE Text Animator Properties") force = true;
+    if (followerActive) force = true;
+    if (!force && !modified && numKeys === 0 && !expr && !leaderSeparated) return null;
+
+    var o = { mn: p.matchName, name: p.name };
+    if (parent && parent.propertyType === PropertyType.INDEXED_GROUP) o.idx = p.propertyIndex;
+    if (leaderSeparated) {
+        o.separated = true;
+    } else if (numKeys > 0) {
+        o.keys = [];
+        for (var i = 1; i <= numKeys; i++) o.keys.push(RT.serKey(p, i));
+    } else {
+        try { o.value = RT.serValue(p, p.valueAtTime(0, true)); } catch (e) { return null; }
+    }
+    if (expr) { o.expr = expr; o.exprOn = exprOn; }
+    return o;
+};
+
+RT.serGroupAttrs = function (g, o) {
+    try { if (g.canSetEnabled) o.enabled = g.enabled; } catch (e) {}
+    if (g.isMask) {
+        try {
+            o.maskMode = RT.enumName(MaskMode, g.maskMode);
+            o.inverted = g.inverted;
+            o.rotoBezier = g.rotoBezier;
+            o.maskMotionBlur = RT.enumName(MaskMotionBlur, g.maskMotionBlur);
+            o.maskFeatherFalloff = RT.enumName(MaskFeatherFalloff, g.maskFeatherFalloff);
+            o.color = RT.roundAll(g.color);
+            o.locked = g.locked;
+        } catch (e) {}
+    }
+};
+
+RT.MASK_ATTRS = { maskMode: MaskMode, maskMotionBlur: MaskMotionBlur, maskFeatherFalloff: MaskFeatherFalloff };
+
+RT.applyGroupAttrs = function (g, o, warn) {
+    var names = ["enabled", "maskMode", "inverted", "rotoBezier", "maskMotionBlur", "maskFeatherFalloff", "color", "locked"];
+    if (RT.has(o, "name") && g.name !== o.name && g.parentProperty && g.parentProperty.propertyType === PropertyType.INDEXED_GROUP) {
+        try { g.name = o.name; } catch (e) { warn(g.name + ": rename to '" + o.name + "': " + e.message); }
+    }
+    for (var i = 0; i < names.length; i++) {
+        var n = names[i];
+        if (!RT.has(o, n)) continue;
+        if (n !== "enabled" && !g.isMask) continue;
+        try {
+            g[n] = RT.MASK_ATTRS[n] ? RT.enumVal(RT.MASK_ATTRS[n], o[n]) : o[n];
+        } catch (e) { warn(g.name + "." + n + ": " + e.message); }
+    }
+};
+
+// Serialize the children of a group (or of a layer). Returns an array of nodes.
+// Layer-level groups AE hides for this kind of layer (their values can't be set and don't render).
+RT.hiddenForLayer = function (L, p) {
+    var mn = p.matchName;
+    if (mn === "ADBE Material Options Group") { try { return !L.threeDLayer || L.matchName === "ADBE Camera Layer" || L.matchName === "ADBE Light Layer"; } catch (e) { return false; } }
+    if (mn === "ADBE Transform Group") { try { return L.matchName === "ADBE AV Layer" && !L.hasVideo && !L.nullLayer; } catch (e) { return false; } }
+    return false;
+};
+
+RT.serChildren = function (g) {
+    var out = [], isLayer = false;
+    try { isLayer = g.propertyDepth === 0; } catch (e) {}
+    for (var i = 1; i <= g.numProperties; i++) {
+        var p;
+        try { p = g.property(i); } catch (e) { continue; }
+        if (!p) continue;
+        if (isLayer && RT.hiddenForLayer(g, p)) continue;
+        var node = RT.isGroup(p) ? RT.serGroup(p, g) : RT.serLeaf(p, g);
+        if (node) out.push(node);
+    }
+    return out;
+};
+
+RT.serGroup = function (g, parent) {
+    if (RT.SKIP_GROUPS[g.matchName]) return null;
+    var indexedChild = parent && parent.propertyType === PropertyType.INDEXED_GROUP;
+    var kids = RT.serChildren(g);
+    if (!kids.length && !indexedChild) return null;
+    var o = { mn: g.matchName, name: g.name };
+    if (indexedChild) o.idx = g.propertyIndex;
+    if (g.propertyType === PropertyType.INDEXED_GROUP) o.indexed = true;
+    RT.serGroupAttrs(g, o);
+    o.props = kids;
+    return o;
+};
+
+// ---------------------------------------------------------------------------
+// Layer / comp serialization
+// ---------------------------------------------------------------------------
+
+RT.LAYER_ATTRS = ["name", "comment", "enabled", "audioEnabled", "solo", "shy", "label", "startTime", "stretch", "inPoint", "outPoint",
+    "threeD", "blendingMode", "trackMatte", "parent", "motionBlur", "adjustment", "guide", "collapse", "timeRemap",
+    "quality", "autoOrient", "preserveTransparency", "effectsActive", "frameBlendingType", "samplingQuality", "lightType", "locked"];
+
+RT.serLayer = function (L, ctx) {
+    var type = RT.layerType(L);
+    var o = { id: RT.readTag(L.comment), index: L.index, name: L.name, type: type };
+    var uc = RT.stripTag(L.comment);
+    if (uc) o.comment = uc;
+
+    var src = null;
+    try { src = L.source; } catch (e) {}
+    if (type === "precomp") {
+        o.source = { type: "comp", comp: ctx.compIdOf(src) };
+    } else if (src && type !== "null") {
+        o.source = { type: "footage", footage: ctx.footageIdOf(src) };
+    }
+
+    o.parent = L.parent ? RT.readTag(L.parent.comment) : null;
+    o.enabled = L.enabled;
+    try { if (L.hasAudio) o.audioEnabled = L.audioEnabled; } catch (e) {}
+    o.solo = L.solo;
+    o.shy = L.shy;
+    o.locked = L.locked;
+    o.label = L.label;
+    o.startTime = L.startTime;
+    o.stretch = RT.round(L.stretch);
+    o.inPoint = L.inPoint;
+    o.outPoint = L.outPoint;
+    try { o.autoOrient = RT.enumName(AutoOrientType, L.autoOrient); } catch (e) {}
+
+    if (type === "light") { try { o.lightType = RT.enumName(LightType, L.lightType); } catch (e) {} }
+    if (type !== "camera" && type !== "light") {
+        o.threeD = L.threeDLayer;
+        o.blendingMode = RT.enumName(BlendingMode, L.blendingMode);
+        o.motionBlur = L.motionBlur;
+        o.adjustment = L.adjustmentLayer;
+        o.guide = L.guideLayer;
+        o.collapse = L.collapseTransformation;
+        o.preserveTransparency = L.preserveTransparency;
+        o.effectsActive = L.effectsActive;
+        try { o.timeRemap = L.timeRemapEnabled; } catch (e) {}
+        try { o.quality = RT.enumName(LayerQuality, L.quality); } catch (e) {}
+        try { o.samplingQuality = RT.enumName(LayerSamplingQuality, L.samplingQuality); } catch (e) {}
+        try { o.frameBlendingType = RT.enumName(FrameBlendingType, L.frameBlendingType); } catch (e) {}
+        try {
+            if (L.trackMatteType !== TrackMatteType.NO_TRACK_MATTE) {
+                o.trackMatte = { type: RT.enumName(TrackMatteType, L.trackMatteType) };
+                try { if (L.trackMatteLayer) o.trackMatte.layer = RT.readTag(L.trackMatteLayer.comment); } catch (e) {}
+            }
+        } catch (e) {}
+    }
+    if (type === "text") {
+        try { var td = L.property("ADBE Text Properties").property("ADBE Text Document").valueAtTime(0, true); o.boxText = td.boxText; if (td.boxText) o.boxTextSize = RT.roundAll(td.boxTextSize); } catch (e) {}
+    }
+    o.props = RT.serChildren(L);
+    return o;
+};
+
+RT.serFootage = function (item) {
+    var o = { id: "F" + item.id, aeId: item.id, name: item.name };
+    var ms = item.mainSource;
+    if (ms instanceof SolidSource) { o.kind = "solid"; o.color = RT.roundAll(ms.color); }
+    else if (ms instanceof FileSource) { o.kind = "file"; o.path = ms.file ? ms.file.fsName : null; o.missing = item.footageMissing; }
+    else { o.kind = "placeholder"; }
+    try { o.width = item.width; o.height = item.height; o.pixelAspect = item.pixelAspect; } catch (e) {}
+    try { o.duration = item.duration; o.frameRate = item.frameRate; } catch (e) {}
+    try { o.isStill = ms.isStill; } catch (e) {}
+    return o;
+};
+
+RT.COMP_ATTRS = ["width", "height", "pixelAspect", "duration", "frameRate", "bgColor", "workAreaStart", "workAreaDuration",
+    "displayStartTime", "motionBlur", "shutterAngle", "shutterPhase", "frameBlending", "draft3d", "renderer"];
+
+RT.serComp = function (comp, ctx) {
+    var o = { id: RT.readTag(comp.comment), aeId: comp.id, name: comp.name };
+    o.width = comp.width; o.height = comp.height; o.pixelAspect = comp.pixelAspect;
+    o.duration = comp.duration; o.frameRate = comp.frameRate; o.bgColor = RT.roundAll(comp.bgColor);
+    o.workAreaStart = comp.workAreaStart; o.workAreaDuration = comp.workAreaDuration;
+    o.displayStartTime = comp.displayStartTime;
+    o.motionBlur = comp.motionBlur; o.shutterAngle = comp.shutterAngle; o.shutterPhase = comp.shutterPhase;
+    o.frameBlending = comp.frameBlending;
+    try { o.draft3d = comp.draft3d; } catch (e) {}
+    try { o.renderer = comp.renderer; } catch (e) {}
+    try {
+        var mp = comp.markerProperty;
+        if (mp && mp.numKeys) o.markers = RT.serLeaf(mp, null);
+    } catch (e) {}
+    o.layers = [];
+    for (var i = 1; i <= comp.numLayers; i++) o.layers.push(RT.serLayer(comp.layer(i), ctx));
+    return o;
+};
+
+// Walk root comp + nested precomps, tagging IDs. Returns the full document object.
+RT.exportTree = function (root) {
+    var comps = [], compIds = {}, compById = {}, footage = [], footageSeen = {}, seenCompTags = {};
+    var ctx = {
+        compIdOf: function (c) { return compIds[c.id]; },
+        footageIdOf: function (item) {
+            if (!footageSeen[item.id]) { footageSeen[item.id] = true; footage.push(RT.serFootage(item)); }
+            return "F" + item.id;
+        }
+    };
+
+    // Pass 1: discover comps (pre-order) and tag them + their layers.
+    var order = [];
+    (function visit(c) {
+        if (compIds[c.id]) return;
+        compIds[c.id] = RT.ensureId(c, "C", seenCompTags);
+        compById[c.id] = c;
+        order.push(c);
+        var seenLayer = {};
+        for (var i = 1; i <= c.numLayers; i++) RT.ensureId(c.layer(i), "L", seenLayer);
+        for (var j = 1; j <= c.numLayers; j++) {
+            var s = null;
+            try { s = c.layer(j).source; } catch (e) {}
+            if (s instanceof CompItem) visit(s);
+        }
+    })(root);
+
+    // Pass 2: serialize.
+    for (var k = 0; k < order.length; k++) comps.push(RT.serComp(order[k], ctx));
+
+    return {
+        format: RT.FORMAT,
+        formatVersion: RT.FORMAT_VERSION,
+        exportedAt: new Date().toString(),
+        aeVersion: app.version,
+        project: app.project.file ? app.project.file.fsName : null,
+        root: compIds[root.id],
+        comps: comps,
+        footage: footage
+    };
+};
+
+// ---------------------------------------------------------------------------
+// Property tree application (shared by Apply and Rebuild)
+// ---------------------------------------------------------------------------
+
+// Path segment for a node: indexed children carry their index, named ones only the matchName.
+RT.seg = function (node, parentIndexed) {
+    return parentIndexed ? node.mn + "#" + node.idx : node.mn;
+};
+
+// Resolve a list of {mn, idx} segments under `root` (a layer). With `create`, missing indexed/addable
+// children are added. `alias` maps path prefixes (JSON indices) to live indices for newly added groups.
+RT.resolve = function (root, segs, create, alias) {
+    var cur = root, key = "";
+    for (var i = 0; i < segs.length; i++) {
+        var s = segs[i], next = null;
+        key += (key ? "/" : "") + s.key;
+        var indexed = cur.propertyType === PropertyType.INDEXED_GROUP;
+        if (indexed && s.idx !== undefined && s.idx !== null) {
+            var li = (alias && alias[key] !== undefined) ? alias[key] : s.idx;
+            if (li <= cur.numProperties) {
+                next = cur.property(li);
+                if (next && next.matchName !== s.mn) next = null;
+            }
+        } else {
+            try { next = cur.property(s.mn); } catch (e) { next = null; }
+        }
+        if (!next && create) {
+            var canAdd = false;
+            try { canAdd = cur.canAddProperty(s.mn); } catch (e) {}
+            if (!canAdd) throw new Error("cannot add '" + s.mn + "' under '" + cur.matchName + "'");
+            next = cur.addProperty(s.mn);
+            if (alias) alias[key] = next.propertyIndex;
+        }
+        if (!next) return null;
+        cur = next;
+    }
+    return cur;
+};
+
+// Flatten a layer's props tree into an ordered list of {key, segs, node, isGroup}.
+RT.flatten = function (nodes) {
+    var out = [], newCount = 0;
+    (function walk(list, segs, prefix, parentIndexed) {
+        for (var i = 0; i < list.length; i++) {
+            var n = list[i];
+            var s = { mn: n.mn, idx: n.idx };
+            if (parentIndexed && (n.idx === undefined || n.idx === null)) s.key = n.mn + "#new" + (++newCount);
+            else s.key = RT.seg(n, parentIndexed);
+            var mySegs = segs.concat([s]);
+            var key = prefix ? prefix + "/" + s.key : s.key;
+            var isGroup = RT.has(n, "props");
+            out.push({ key: key, segs: mySegs, node: n, isGroup: isGroup });
+            if (isGroup) walk(n.props, mySegs, key, n.indexed === true);
+        }
+    })(nodes, [], "", false);
+    return out;
+};
+
+// Set a leaf property's value / keys from a node. Expressions are left to the caller (deferred).
+// Returns true when everything was set.
+RT.applyLeaf = function (prop, node, warn) {
+    if (RT.has(node, "separated")) {
+        try { if (prop.dimensionsSeparated !== node.separated) prop.dimensionsSeparated = node.separated; } catch (e) { warn(prop.name + " separate dimensions: " + e.message); return false; }
+        if (node.separated) return true;
+    }
+    try {
+        if (node.keys && node.keys.length) {
+            RT.setAllKeys(prop, node.keys, warn);
+        } else if (RT.has(node, "value")) {
+            if (prop.numKeys > 0) RT.removeAllKeys(prop);
+            var base = (prop.propertyValueType === PropertyValueType.TEXT_DOCUMENT) ? prop.valueAtTime(0, true) : null;
+            prop.setValue(RT.deserValue(prop, node.value, base));
+        }
+    } catch (e) { warn(prop.name + " (" + node.mn + "): " + e.message); return false; }
+    return true;
+};
+
+RT.applyExpr = function (prop, node, warn) {
+    try {
+        if (!prop.canSetExpression) return;
+        var ex = node.expr || "";
+        if (prop.expression !== ex) prop.expression = ex;
+        if (ex && RT.has(node, "exprOn") && prop.expressionEnabled !== node.exprOn) prop.expressionEnabled = node.exprOn;
+    } catch (e) { warn(prop.name + " expression: " + e.message); }
+};
+
+// Build a full props tree onto a layer (used by Rebuild and for layers added during Apply).
+// Expressions are pushed into `deferred` as {layer, segs, node}.
+RT.buildProps = function (layer, nodes, deferred, warn0) {
+    var flat = RT.flatten(nodes), alias = {};
+    var warn = function (m) { warn0(layer.name + ": " + m); };
+    for (var i = 0; i < flat.length; i++) {
+        var f = flat[i], p = null;
+        try { p = RT.resolve(layer, f.segs, true, alias); } catch (e) { warn(layer.name + " / " + f.key + ": " + e.message); continue; }
+        if (!p) { warn(layer.name + " / " + f.key + ": not found"); continue; }
+        if (f.isGroup) RT.applyGroupAttrs(p, f.node, warn);
+        else {
+            RT.applyLeaf(p, f.node, warn);
+            if (f.node.expr) deferred.push({ layer: layer, segs: f.segs, node: f.node, alias: alias });
+        }
+    }
+};
+
+RT.runDeferredExprs = function (deferred, warn) {
+    for (var i = 0; i < deferred.length; i++) {
+        var d = deferred[i], p = null;
+        try { p = RT.resolve(d.layer, d.segs, false, d.alias); } catch (e) {}
+        if (p) RT.applyExpr(p, d.node, function (m) { warn(d.layer.name + ": " + m); });
+        else warn(d.layer.name + ": could not re-find property for expression " + d.node.mn);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Layer attributes (shared)
+// ---------------------------------------------------------------------------
+
+// Set one layer attribute. `layerById(id)` resolves parent / matte references in the target comp.
+RT.SIMPLE_LAYER_PROPS = { name: "name", enabled: "enabled", solo: "solo", shy: "shy", locked: "locked", label: "label",
+    startTime: "startTime", stretch: "stretch", inPoint: "inPoint", outPoint: "outPoint", threeD: "threeDLayer",
+    motionBlur: "motionBlur", adjustment: "adjustmentLayer", guide: "guideLayer", collapse: "collapseTransformation",
+    timeRemap: "timeRemapEnabled", preserveTransparency: "preserveTransparency", effectsActive: "effectsActive", audioEnabled: "audioEnabled" };
+
+RT.setLayerAttr = function (L, name, v, layerById, warn) {
+    try {
+        // Skip no-ops (AE refuses some even when unchanged, e.g. solo on a disabled layer).
+        if (RT.SIMPLE_LAYER_PROPS[name]) { try { if (RT.equal(L[RT.SIMPLE_LAYER_PROPS[name]], v)) return; } catch (e0) {} }
+        if (name === "collapse" && !L.canSetCollapseTransformation) { warn(L.name + ": cannot set collapse transformation on this layer type"); return; }
+        switch (name) {
+            case "name": L.name = v; break;
+            case "comment": L.comment = RT.withTag(v || "", RT.readTag(L.comment)); break;
+            case "enabled": L.enabled = v; break;
+            case "audioEnabled": if (L.hasAudio) L.audioEnabled = v; break;
+            case "solo": L.solo = v; break;
+            case "shy": L.shy = v; break;
+            case "locked": L.locked = v; break;
+            case "label": L.label = v; break;
+            case "startTime": L.startTime = v; break;
+            case "stretch": L.stretch = v; break;
+            case "inPoint": L.inPoint = v; break;
+            case "outPoint": L.outPoint = v; break;
+            case "threeD": L.threeDLayer = v; break;
+            case "blendingMode": L.blendingMode = RT.enumVal(BlendingMode, v); break;
+            case "motionBlur": L.motionBlur = v; break;
+            case "adjustment": L.adjustmentLayer = v; break;
+            case "guide": L.guideLayer = v; break;
+            case "collapse": L.collapseTransformation = v; break;
+            case "timeRemap": if (L.canSetTimeRemapEnabled) L.timeRemapEnabled = v; break;
+            case "quality": L.quality = RT.enumVal(LayerQuality, v); break;
+            case "samplingQuality": L.samplingQuality = RT.enumVal(LayerSamplingQuality, v); break;
+            case "autoOrient": L.autoOrient = RT.enumVal(AutoOrientType, v); break;
+            case "preserveTransparency": L.preserveTransparency = v; break;
+            case "effectsActive": L.effectsActive = v; break;
+            case "frameBlendingType": L.frameBlendingType = RT.enumVal(FrameBlendingType, v); break;
+            case "lightType": L.lightType = RT.enumVal(LightType, v); break;
+            case "parent":
+                var par = v ? layerById(v) : null;
+                if (v && !par) { warn(L.name + ": parent " + v + " not found"); break; }
+                // Jump = keep the raw transform values from the JSON.
+                if (typeof L.setParentWithJump === "function") L.setParentWithJump(par); else L.parent = par;
+                break;
+            case "trackMatte":
+                if (!v) {
+                    if (typeof L.removeTrackMatte === "function") L.removeTrackMatte(); else L.trackMatteType = TrackMatteType.NO_TRACK_MATTE;
+                    break;
+                }
+                var mt = RT.enumVal(TrackMatteType, v.type);
+                var ml = v.layer ? layerById(v.layer) : null;
+                if (typeof L.setTrackMatte === "function" && ml) L.setTrackMatte(ml, mt);
+                else L.trackMatteType = mt;
+                break;
+        }
+    } catch (e) { warn(L.name + "." + name + ": " + e.message); }
+};
+
+// Order in which attributes are applied when building/patching a layer.
+RT.ATTR_ORDER_EARLY = ["name", "comment", "threeD", "timeRemap", "stretch", "startTime", "inPoint", "outPoint", "lightType"];
+RT.ATTR_ORDER_LINKS = ["parent", "trackMatte"];
+RT.ATTR_ORDER_LATE = ["enabled", "audioEnabled", "solo", "shy", "label", "blendingMode", "motionBlur", "adjustment", "guide", "collapse",
+    "quality", "samplingQuality", "autoOrient", "preserveTransparency", "effectsActive", "frameBlendingType", "locked"];
+
+// ---------------------------------------------------------------------------
+// Layer creation (shared by Rebuild and by Apply for newly added layers)
+// ---------------------------------------------------------------------------
+
+// ctx: { compFor(compRtid) -> CompItem, footageFor(footageRef) -> AVItem|null, footageDef(ref) -> def, warn }
+RT.createLayer = function (comp, ld, ctx) {
+    var L = null, layers = comp.layers, center = [comp.width / 2, comp.height / 2];
+    var t = ld.type;
+    if (t === "text") {
+        L = ld.boxText && ld.boxTextSize ? layers.addBoxText(ld.boxTextSize) : layers.addText("");
+    } else if (t === "shape") {
+        L = layers.addShape();
+    } else if (t === "camera") {
+        L = layers.addCamera(ld.name, center);
+    } else if (t === "light") {
+        L = layers.addLight(ld.name, center);
+    } else if (t === "null") {
+        L = layers.addNull(comp.duration);
+    } else if (t === "precomp") {
+        var sub = ctx.compFor(ld.source.comp);
+        if (!sub) throw new Error("precomp " + ld.source.comp + " not built");
+        L = layers.add(sub);
+    } else {
+        var ref = ld.source ? ld.source.footage : null;
+        var item = ref ? ctx.footageFor(ref) : null;
+        var def = ref ? ctx.footageDef(ref) : null;
+        if (item) L = layers.add(item);
+        else if (def && def.kind === "solid") L = layers.addSolid(def.color || [0, 0, 0], def.name, def.width || comp.width, def.height || comp.height, def.pixelAspect || 1, comp.duration);
+        else throw new Error("footage " + ref + " unavailable");
+    }
+    L.comment = RT.withTag(ld.comment || "", ld.id || RT.newId("L"));
+    return L;
+};
+
+// ---------------------------------------------------------------------------
+// Footage resolution (shared by Rebuild and by Apply for added / re-sourced layers)
+// ---------------------------------------------------------------------------
+
+RT.makeFootageResolver = function (doc, warn) {
+    var defs = {}, cache = {};
+    for (var i = 0; i < (doc.footage || []).length; i++) defs[doc.footage[i].id] = doc.footage[i];
+
+    function samePath(item, path) {
+        try { return item.mainSource instanceof FileSource && item.mainSource.file && item.mainSource.file.fsName === path; } catch (e) { return false; }
+    }
+
+    function find(ref) {
+        var def = defs[ref];
+        if (!def) { warn("footage " + ref + " is not in the JSON footage list"); return null; }
+        var item = def.aeId ? RT.findItemById(def.aeId) : null;
+        if (item && item instanceof FootageItem) {
+            if (def.kind === "file" && samePath(item, def.path)) return item;
+            if (def.kind === "solid" && item.mainSource instanceof SolidSource) return item;
+            if (def.kind === "placeholder") return item;
+        }
+        if (def.kind === "solid") return null; // caller creates a new solid
+        if (def.kind === "file" && def.path) {
+            for (var j = 1; j <= app.project.numItems; j++) {
+                var it = app.project.item(j);
+                if (it instanceof FootageItem && samePath(it, def.path)) return it;
+            }
+            var f = new File(def.path);
+            if (f.exists) {
+                try {
+                    var io = new ImportOptions(f);
+                    if (def.isStill === false && io.canImportAs(ImportAsType.FOOTAGE)) io.importAs = ImportAsType.FOOTAGE;
+                    return app.project.importFile(io);
+                } catch (e) { warn("import " + def.path + ": " + e.message); }
+            } else warn("missing footage file " + def.path + " — using a placeholder");
+        }
+        try {
+            return app.project.importPlaceholder(def.name, def.width || 1920, def.height || 1080, def.frameRate || 25, def.duration || 10);
+        } catch (e) { warn("placeholder for " + def.name + ": " + e.message); }
+        return null;
+    }
+
+    return {
+        def: function (ref) { return defs[ref] || null; },
+        item: function (ref) { if (!RT.has(cache, ref)) cache[ref] = find(ref); return cache[ref]; }
+    };
+};
+
+// Next free "<base> vN" name (N >= 2), where base has any existing " vN" suffix removed.
+RT.nextVersionName = function (name) {
+    var base = name.replace(/ v\d+$/, ""), max = 1;
+    var re = new RegExp("^" + base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + " v(\\d+)$");
+    for (var i = 1; i <= app.project.numItems; i++) {
+        var m = re.exec(app.project.item(i).name);
+        if (m) max = Math.max(max, parseInt(m[1], 10));
+    }
+    return base + " v" + (max + 1);
+};
+
+RT.setCompAttr = function (comp, name, v, warn) {
+    try {
+        if (name === "workAreaStart") v = Math.max(0, Math.min(v, comp.duration - comp.frameDuration));
+        if (name === "workAreaDuration") v = Math.max(comp.frameDuration, Math.min(v, comp.duration - comp.workAreaStart));
+        comp[name] = v;
+    } catch (e) { warn(comp.name + "." + name + ": " + e.message); }
+};
+
+// Wrap a warn() so "property is hidden" errors are counted, not reported one by one.
+// AE refuses to set hidden properties; they have no effect in the current layer state.
+RT.HIDDEN_RE = /property or a parent property is hidden/;
+RT.splitWarn = function (warnings, hidden) {
+    return function (m) { if (RT.HIDDEN_RE.test(m)) hidden.push(m); else warnings.push(m); };
+};

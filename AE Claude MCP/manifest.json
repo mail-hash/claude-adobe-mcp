@@ -1,0 +1,150 @@
+{
+  "manifest_version": "0.2",
+  "name": "ae-round-trip",
+  "display_name": "After Effects Round Trip",
+  "version": "1.2.0",
+  "description": "Let Claude read, edit and preview your open After Effects comps. Edits go into new comp versions; nothing is saved.",
+  "long_description": "Exports a comp and its nested precomps (layers, parenting, keyframes with easing, effects, masks, shapes, text, expressions, footage) to JSON. Claude edits that JSON, and After Effects duplicates the comp as a new version (v2, v3, ...) with only the edited properties changed. Claude can also render frames to check its work. Requires After Effects running on this Mac with Preferences > Scripting & Expressions > 'Allow Scripts to Write Files and Access Network' turned on.",
+  "author": {
+    "name": "Chris Morris"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/index.js"
+      ],
+      "env": {
+        "AE_APP": "${user_config.ae_app}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "ae_status",
+      "description": "After Effects status"
+    },
+    {
+      "name": "ae_dismiss_dialog",
+      "description": "Dismiss an After Effects dialog"
+    },
+    {
+      "name": "ae_job_status",
+      "description": "Job status"
+    },
+    {
+      "name": "ae_job_wait",
+      "description": "Wait for job"
+    },
+    {
+      "name": "ae_run_script",
+      "description": "Run ExtendScript"
+    },
+    {
+      "name": "ae_open_project",
+      "description": "Open project"
+    },
+    {
+      "name": "ae_new_project",
+      "description": "New project"
+    },
+    {
+      "name": "ae_save",
+      "description": "Save project"
+    },
+    {
+      "name": "ae_save_as",
+      "description": "Save project as"
+    },
+    {
+      "name": "ae_import",
+      "description": "Import file"
+    },
+    {
+      "name": "ae_render_comp",
+      "description": "Render comp (wait)"
+    },
+    {
+      "name": "ae_render_comps",
+      "description": "Render comps (background)"
+    },
+    {
+      "name": "ae_save_frame",
+      "description": "Save frame to PNG"
+    },
+    {
+      "name": "ae_save_frames",
+      "description": "Save many frames"
+    },
+    {
+      "name": "ae_render_frame",
+      "description": "Render a frame (inline)"
+    },
+    {
+      "name": "ae_compare",
+      "description": "Compare comp against reference"
+    },
+    {
+      "name": "ae_list_fonts_used",
+      "description": "Fonts used"
+    },
+    {
+      "name": "ae_replace_font",
+      "description": "Replace font"
+    },
+    {
+      "name": "ae_list_comps",
+      "description": "List comps"
+    },
+    {
+      "name": "ae_get_comp",
+      "description": "Export a comp"
+    },
+    {
+      "name": "ae_get_layers",
+      "description": "Get layer details"
+    },
+    {
+      "name": "ae_apply_edits",
+      "description": "Apply edits"
+    },
+    {
+      "name": "ae_rebuild_comp",
+      "description": "Rebuild comp from export"
+    },
+    {
+      "name": "ae_remove_versions",
+      "description": "Remove versions"
+    }
+  ],
+  "user_config": {
+    "ae_app": {
+      "type": "string",
+      "title": "After Effects application name",
+      "description": "Leave empty to use whichever After Effects is running (e.g. 'Adobe After Effects 2026').",
+      "default": "",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "keywords": [
+    "after effects",
+    "motion graphics",
+    "animation",
+    "adobe"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mail-hash/claude-adobe-mcp"
+  }
+}

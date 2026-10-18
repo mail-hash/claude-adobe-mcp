@@ -1,0 +1,173 @@
+{
+  "manifest_version": "0.2",
+  "name": "premiere-bridge",
+  "display_name": "Premiere Pro Bridge",
+  "version": "1.1.0",
+  "description": "Let Claude drive Adobe Premiere Pro: projects, imports (incl. Dynamic Link AE comps), sequences, clips, tracks, frames and renders.",
+  "long_description": "Needs the Claude Bridge CEP panel installed in Premiere Pro (Window \u203a Extensions \u203a Claude Bridge). The panel runs a localhost-only HTTP server inside Premiere; this MCP server talks to it. Nothing is saved unless Claude calls pr_save_project / pr_save_as.",
+  "author": {
+    "name": "Chris Morris"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/index.js"
+      ],
+      "env": {
+        "PR_BRIDGE_PORT": "${user_config.port}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "pr_status",
+      "description": "Premiere status"
+    },
+    {
+      "name": "pr_dismiss_dialog",
+      "description": "Dismiss a Premiere dialog"
+    },
+    {
+      "name": "pr_open_project",
+      "description": "Open project"
+    },
+    {
+      "name": "pr_new_project",
+      "description": "New project"
+    },
+    {
+      "name": "pr_save_project",
+      "description": "Save project"
+    },
+    {
+      "name": "pr_save_as",
+      "description": "Save project as"
+    },
+    {
+      "name": "pr_close_project",
+      "description": "Close project"
+    },
+    {
+      "name": "pr_import_files",
+      "description": "Import files"
+    },
+    {
+      "name": "pr_import_ae_comps",
+      "description": "Import After Effects comps (Dynamic Link)"
+    },
+    {
+      "name": "pr_list_items",
+      "description": "List project items"
+    },
+    {
+      "name": "pr_list_sequences",
+      "description": "List sequences"
+    },
+    {
+      "name": "pr_get_sequence",
+      "description": "Get sequence"
+    },
+    {
+      "name": "pr_create_sequence",
+      "description": "Create sequence"
+    },
+    {
+      "name": "pr_place_clip",
+      "description": "Place clip"
+    },
+    {
+      "name": "pr_place_clips",
+      "description": "Place clips (batch)"
+    },
+    {
+      "name": "pr_replace_clip",
+      "description": "Replace clip"
+    },
+    {
+      "name": "pr_remove_clips",
+      "description": "Remove clips"
+    },
+    {
+      "name": "pr_set_clip_enabled",
+      "description": "Enable / disable clip"
+    },
+    {
+      "name": "pr_move_clip",
+      "description": "Move / nudge clip"
+    },
+    {
+      "name": "pr_set_track_enabled",
+      "description": "Set track enabled / locked"
+    },
+    {
+      "name": "pr_track",
+      "description": "Track settings"
+    },
+    {
+      "name": "pr_add_tracks",
+      "description": "Add tracks"
+    },
+    {
+      "name": "pr_build_from_timeline",
+      "description": "Build sequence from JSON timeline"
+    },
+    {
+      "name": "pr_compare_sequences",
+      "description": "Compare two sequences"
+    },
+    {
+      "name": "pr_export_frame",
+      "description": "Export frame to PNG"
+    },
+    {
+      "name": "pr_export_frames",
+      "description": "Export many frames"
+    },
+    {
+      "name": "pr_show_frame",
+      "description": "Show frame"
+    },
+    {
+      "name": "pr_list_export_presets",
+      "description": "List export presets"
+    },
+    {
+      "name": "pr_render",
+      "description": "Render sequence"
+    },
+    {
+      "name": "pr_run_script",
+      "description": "Run ExtendScript in Premiere"
+    }
+  ],
+  "user_config": {
+    "port": {
+      "type": "string",
+      "title": "Bridge port",
+      "description": "Port the Claude Bridge panel listens on (default 8098; also set cep/port.txt if you change it).",
+      "default": "8098",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "keywords": [
+    "premiere pro",
+    "video editing",
+    "adobe"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mail-hash/claude-adobe-mcp"
+  }
+}
