@@ -4,7 +4,7 @@
    Times: Premiere ticks are 254016000000 per second. All results carry seconds and frames. */
 // $.evalFile from inside a function would make a plain `var` local to that function; bind the namespace explicitly.
 $.global.CPB = (function () {
-    var C = { VERSION: "1.0.0" };
+    var C = { VERSION: "1.1.0" };
     var TICKS = 254016000000;
 
     // ---------------------------------------------------------------- JSON (own, prototype-free)
@@ -620,6 +620,163 @@ $.global.CPB = (function () {
         if (!ok) { try { q.addTracks(nv, bv, na, 1, ba); ok = true; } catch (e2) { err = e2; } }
         if (!ok) fail("addTracks failed: " + (err ? err.message : "unknown"));
         return { videoTracks: { before: bv, after: seq.videoTracks.numTracks }, audioTracks: { before: ba, after: seq.audioTracks.numTracks } };
+    };
+
+    // ---------------------------------------------------------------- versions (duplicate / delete sequences)
+    function versionName(base) {
+        var p = requireProject(), m = /^(.*) v(\d+)$/.exec(base), root = m ? m[1] : base, n = 1, i;
+        for (i = 0; i < p.sequences.numSequences; i++) { var mm = /^(.*) v(\d+)$/.exec(p.sequences[i].name); if (mm && mm[1] === root && Number(mm[2]) > n) n = Number(mm[2]); }
+        return root + " v" + (n + 1);
+    }
+    function seqNamed(name) { var p = requireProject(); for (var i = 0; i < p.sequences.numSequences; i++) if (p.sequences[i].name === name) return p.sequences[i]; return null; }
+    function seqSummary(seq) { var o = { id: seq.sequenceID, name: seq.name, fps: round(seqFps(seq)), end: timeInfo(seq.end, seq), videoTracks: seq.videoTracks.numTracks, audioTracks: seq.audioTracks.numTracks, clips: 0 }; try { for (var t = 0; t < seq.videoTracks.numTracks; t++) o.clips += seq.videoTracks[t].clips.numItems; for (var u = 0; u < seq.audioTracks.numTracks; u++) o.clips += seq.audioTracks[u].clips.numItems; } catch (e) {} return o; }
+    // sequence.clone() names the copy "<name> Copy" and makes it active; rename it and restore the active sequence.
+    C.duplicateSequence = function (a) {
+        var p = requireProject(), seq = findSequence(a.sequence);
+        var name = a.name ? String(a.name) : versionName(seq.name);
+        if (seqNamed(name)) fail("A sequence named '" + name + "' already exists.");
+        if (a.dryRun) return { dryRun: true, plan: { action: "duplicateSequence", source: { id: seq.sequenceID, name: seq.name }, name: name, activate: !!a.activate } };
+        var wasActive = null; try { wasActive = p.activeSequence; } catch (e0) {}
+        var before = {}; for (var i = 0; i < p.sequences.numSequences; i++) before[p.sequences[i].sequenceID] = true;
+        var ok = false; try { ok = seq.clone(); } catch (e1) { fail("clone failed: " + e1.message); }
+        var copy = null;
+        for (var j = 0; j < p.sequences.numSequences; j++) if (!before[p.sequences[j].sequenceID]) copy = p.sequences[j];
+        if (!copy) fail("Premiere reported " + ok + " from clone() but no new sequence appeared.");
+        try { copy.name = name; } catch (e2) {}
+        var notes = [];
+        if (copy.name !== name) notes.push("Premiere kept the name '" + copy.name + "'");
+        if (!a.activate && wasActive) { try { p.activeSequence = wasActive; } catch (e3) { notes.push("could not restore the active sequence"); } }
+        var out = { sequence: seqSummary(copy), source: { id: seq.sequenceID, name: seq.name }, active: p.activeSequence ? p.activeSequence.name : null };
+        if (notes.length) out.notes = notes;
+        return out;
+    };
+    C.deleteSequence = function (a) {
+        var p = requireProject(), seq = findSequence(a.sequence);
+        var versioned = /^.* v\d+$/.test(seq.name) || /^.* Copy( Copy)*$/.test(seq.name);
+        if (!versioned && !a.force) fail("'" + seq.name + "' is not a version these tools create (' vN' or ' Copy'); pass force: true to delete it anyway.");
+        var info = seqSummary(seq);
+        if (a.dryRun) return { dryRun: true, plan: { action: "deleteSequence", sequence: info } };
+        var ok = false; try { ok = p.deleteSequence(seq); } catch (e) { fail("deleteSequence failed: " + e.message); }
+        if (!ok) fail("Premiere refused to delete '" + info.name + "'.");
+        return { deleted: info, remaining: p.sequences.numSequences };
+    };
+
+    // ---------------------------------------------------------------- markers (sequence markers)
+    var MARKER_COLORS = ["green", "red", "purple", "orange", "yellow", "white", "blue", "cyan"];
+    function markerInfo(m, seq, index) {
+        var o = { index: index, guid: null, name: "", comments: "", type: null };
+        try { o.guid = m.guid; } catch (e0) {}
+        try { o.name = m.name; } catch (e1) {}
+        try { o.comments = m.comments; } catch (e2) {}
+        try { o.type = m.type; } catch (e3) {}
+        o.start = timeInfo(m.start, seq); o.end = timeInfo(m.end, seq);
+        try { o.duration = timeInfo(secondsOf(m.end) - secondsOf(m.start), seq); } catch (e4) {}
+        try { var ci = m.getColorByIndex(); o.colorIndex = ci; o.color = MARKER_COLORS[ci] || String(ci); } catch (e5) {}
+        try { if (o.type === "WebLink") { o.url = m.getWebLinkURL(); o.frameTarget = m.getWebLinkFrameTarget(); } } catch (e6) {}
+        return o;
+    }
+    function allMarkers(seq) { var out = [], ms = seq.markers, n = 0; try { n = ms.numMarkers; } catch (e) {} for (var i = 0; i < n; i++) { try { out.push(ms[i]); } catch (e2) {} } return out; }
+    function colorIndexArg(c) {
+        if (c === undefined || c === null) return null;
+        if (typeof c === "number") return c;
+        var s = String(c).toLowerCase(); for (var i = 0; i < MARKER_COLORS.length; i++) if (MARKER_COLORS[i] === s) return i;
+        if (/^\d+$/.test(s)) return Number(s);
+        fail("unknown marker color '" + c + "' (use 0-7 or " + MARKER_COLORS.join("/") + ")");
+    }
+    C.listMarkers = function (a) {
+        var seq = findSequence(a.sequence), ms = allMarkers(seq), out = [];
+        var from = timeArg(a, "fromSeconds", "fromFrame", seq), to = timeArg(a, "toSeconds", "toFrame", seq);
+        for (var i = 0; i < ms.length; i++) {
+            var info = markerInfo(ms[i], seq, i);
+            if (from !== null && info.start.seconds < from - 1e-6) continue;
+            if (to !== null && info.start.seconds > to + 1e-6) continue;
+            if (a.filter && String(info.name + " " + info.comments).toLowerCase().indexOf(String(a.filter).toLowerCase()) < 0) continue;
+            out.push(info);
+        }
+        return { sequence: { id: seq.sequenceID, name: seq.name }, total: ms.length, markers: out };
+    };
+    C.addMarker = function (a) {
+        var seq = findSequence(a.sequence);
+        var start = timeArg(a, "startSeconds", "startFrame", seq); if (start === null) fail("give startSeconds or startFrame");
+        var end = timeArg(a, "endSeconds", "endFrame", seq);
+        var dur = timeArg(a, "durationSeconds", "durationFrames", seq);
+        if (end === null && dur !== null) end = start + dur;
+        if (end !== null && end < start) fail("end is before start");
+        var type = a.type ? String(a.type).toLowerCase() : "comment", ci = colorIndexArg(a.color);
+        if (a.dryRun) return { dryRun: true, plan: { action: "addMarker", name: a.name || "", start: timeInfo(start, seq), end: timeInfo(end === null ? start : end, seq), type: type, color: ci === null ? null : (MARKER_COLORS[ci] || ci) } };
+        var m = seq.markers.createMarker(start);
+        if (!m) fail("Premiere did not create the marker");
+        if (a.name !== undefined && a.name !== null) m.name = String(a.name);
+        if (a.comments !== undefined && a.comments !== null) m.comments = String(a.comments);
+        if (end !== null) { try { m.end = end; } catch (e1) {} }   // numbers in seconds; Time objects / strings throw in 26.5
+        var notes = [];
+        try {
+            if (type === "chapter") m.setTypeAsChapter();
+            else if (type === "segmentation") m.setTypeAsSegmentation();
+            else if (type === "weblink" || type === "web_link") m.setTypeAsWebLink(String(a.url || ""), String(a.frameTarget || ""));
+            else m.setTypeAsComment();
+        } catch (e2) { notes.push("type not set: " + e2.message); }
+        if (ci !== null) { try { m.setColorByIndex(ci); } catch (e3) { notes.push("color not set: " + e3.message); } }
+        var ms = allMarkers(seq), idx = -1; for (var i = 0; i < ms.length; i++) { try { if (ms[i].guid === m.guid) idx = i; } catch (e4) {} }
+        var out = { marker: markerInfo(m, seq, idx), total: ms.length };
+        if (notes.length) out.notes = notes;
+        return out;
+    };
+    C.removeMarkers = function (a) {
+        var seq = findSequence(a.sequence), ms = allMarkers(seq), victims = [], i;
+        var from = timeArg(a, "fromSeconds", "fromFrame", seq), to = timeArg(a, "toSeconds", "toFrame", seq);
+        var guids = {}, hasGuids = false; if (a.guids && a.guids.length) { hasGuids = true; for (i = 0; i < a.guids.length; i++) guids[String(a.guids[i])] = true; }
+        var idxs = {}, hasIdx = false; if (a.indexes && a.indexes.length) { hasIdx = true; for (i = 0; i < a.indexes.length; i++) idxs[Number(a.indexes[i])] = true; }
+        if (!a.all && !hasGuids && !hasIdx && from === null && to === null && !a.filter) fail("give guids, indexes, a time range (fromFrame/toFrame), a name filter, or all: true");
+        for (i = 0; i < ms.length; i++) {
+            var info = markerInfo(ms[i], seq, i), hit = true;
+            if (hasGuids && !guids[String(info.guid)]) hit = false;
+            if (hasIdx && !idxs[i]) hit = false;
+            if (from !== null && info.start.seconds < from - 1e-6) hit = false;
+            if (to !== null && info.start.seconds > to + 1e-6) hit = false;
+            if (a.filter && String(info.name + " " + info.comments).toLowerCase().indexOf(String(a.filter).toLowerCase()) < 0) hit = false;
+            if (hit) victims.push({ marker: ms[i], info: info });
+        }
+        var planned = []; for (i = 0; i < victims.length; i++) planned.push(victims[i].info);
+        if (a.dryRun) return { dryRun: true, plan: { action: "removeMarkers", markers: planned } };
+        for (i = victims.length - 1; i >= 0; i--) { try { seq.markers.deleteMarker(victims[i].marker); } catch (e) { fail("deleteMarker failed on '" + victims[i].info.name + "': " + e.message); } }
+        return { removed: planned, remaining: seq.markers.numMarkers };
+    };
+
+    // ---------------------------------------------------------------- sequence range (in/out points, work area)
+    function rangeInfo(seq) {
+        var o = {};
+        try { o.inPoint = timeInfo(seq.getInPointAsTime(), seq); o.outPoint = timeInfo(seq.getOutPointAsTime(), seq); } catch (e0) {}
+        try { o.workArea = { enabled: !!seq.isWorkAreaEnabled(), inPoint: timeInfo(seq.getWorkAreaInPointAsTime(), seq), outPoint: timeInfo(seq.getWorkAreaOutPointAsTime(), seq) }; } catch (e1) {}
+        o.end = timeInfo(seq.end, seq);
+        return o;
+    }
+    C.sequenceRange = function (a) {
+        var seq = findSequence(a.sequence);
+        var inS = timeArg(a, "inSeconds", "inFrame", seq), outS = timeArg(a, "outSeconds", "outFrame", seq);
+        var waIn = timeArg(a, "workAreaInSeconds", "workAreaInFrame", seq), waOut = timeArg(a, "workAreaOutSeconds", "workAreaOutFrame", seq);
+        var wantsSet = inS !== null || outS !== null || waIn !== null || waOut !== null || (a.workAreaEnabled !== undefined && a.workAreaEnabled !== null);
+        if (!wantsSet) return { sequence: { id: seq.sequenceID, name: seq.name }, range: rangeInfo(seq) };
+        if (a.dryRun) return { dryRun: true, plan: { action: "sequenceRange", inPoint: inS === null ? null : timeInfo(inS, seq), outPoint: outS === null ? null : timeInfo(outS, seq), workAreaIn: waIn === null ? null : timeInfo(waIn, seq), workAreaOut: waOut === null ? null : timeInfo(waOut, seq), workAreaEnabled: a.workAreaEnabled === undefined ? null : !!a.workAreaEnabled } };
+        var notes = [];
+        if (inS !== null) { try { seq.setInPoint(inS); } catch (e0) { notes.push("setInPoint: " + e0.message); } }
+        if (outS !== null) { try { seq.setOutPoint(outS); } catch (e1) { notes.push("setOutPoint: " + e1.message); } }
+        if (a.workAreaEnabled !== undefined && a.workAreaEnabled !== null) { try { seq.setWorkAreaEnabled(!!a.workAreaEnabled); } catch (e2) { notes.push("setWorkAreaEnabled: " + e2.message); } }
+        if (waIn !== null || waOut !== null) {
+            // Premiere 26.5 accepts these calls (DOM and QE) but leaves the work area unchanged; try both, then verify.
+            try { if (waOut !== null) seq.setWorkAreaOutPoint(waOut); if (waIn !== null) seq.setWorkAreaInPoint(waIn); } catch (e3) {}
+            var gotIn = secondsOf(seq.getWorkAreaInPointAsTime()), gotOut = secondsOf(seq.getWorkAreaOutPointAsTime());
+            var okIn = waIn === null || Math.abs(gotIn - waIn) < 0.002, okOut = waOut === null || Math.abs(gotOut - waOut) < 0.002;
+            if (!okIn || !okOut) {
+                try { var q = qeSequence(seq); q.setWorkInOutPoints(tcOf(waIn === null ? gotIn : waIn, seqFps(seq)), tcOf(waOut === null ? gotOut : waOut, seqFps(seq))); } catch (e4) {}
+                gotIn = secondsOf(seq.getWorkAreaInPointAsTime()); gotOut = secondsOf(seq.getWorkAreaOutPointAsTime());
+                okIn = waIn === null || Math.abs(gotIn - waIn) < 0.002; okOut = waOut === null || Math.abs(gotOut - waOut) < 0.002;
+            }
+            if (!okIn || !okOut) notes.push("Premiere's scripting API accepted the work-area change but did not apply it (known in 26.5); set the in/out points instead and render with range: inout.");
+        }
+        var out = { sequence: { id: seq.sequenceID, name: seq.name }, range: rangeInfo(seq) };
+        if (notes.length) out.notes = notes;
+        return out;
     };
 
     // ---------------------------------------------------------------- stills & render

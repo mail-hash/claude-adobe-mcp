@@ -25,10 +25,13 @@ pr_save_project / pr_save_as.
 Placing After Effects comps: use video_only: true (Dynamic Link comps carry silent audio that otherwise lands on
 audio tracks). pr_place_clips places a whole list in one call; pr_build_from_timeline builds or patches a sequence
 from a JSON timeline (importing missing media / AE comps first). pr_compare_sequences verifies a rebuild against a reference.
+Versions: pr_duplicate_sequence copies a sequence as "<name> v2" before a batch of edits (the undo point); pr_remove_sequence
+deletes such versions. Markers: pr_list_markers / pr_add_marker / pr_remove_markers (sequence markers). pr_sequence_range reads or
+sets in/out points (work-area changes are accepted but not applied by Premiere 26.5; the result says so).
 pr_run_script runs raw ExtendScript with helpers: getProject(nameOrPath), getSequence(project, nameOrId), findItem(ref),
 findBin(path, create), qeSequence(seq), makeTime(sec), timeInfo(t, seq), log(...) (collected into "output").`;
 
-const server = new McpServer({ name: "premiere-bridge", version: "1.1.0" }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: "premiere-bridge", version: "1.2.0" }, { instructions: INSTRUCTIONS });
 const text = (s) => ({ content: [{ type: "text", text: typeof s === "string" ? s : JSON.stringify(s, null, 1) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: String(e?.message ?? e) + (e?.detail ? "\n" + JSON.stringify(e.detail, null, 1) : "") }] });
 const tool = (name, def, fn) => server.registerTool(name, def, async (args) => { try { return await fn(args); } catch (e) { return fail(e); } });
@@ -223,6 +226,52 @@ tool("pr_add_tracks", {
   description: "Append video and/or audio tracks to a sequence (audio_type: 0 mono, 1 stereo (default), 2 5.1, 3 adaptive).",
   inputSchema: { sequence: Seq, video: z.number().int().optional(), audio: z.number().int().optional(), audio_type: z.number().int().optional(), project: Project, dry_run: DryRun },
 }, async (a) => text(await call("addTracks", { sequence: a.sequence, video: a.video, audio: a.audio, audioType: a.audio_type, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+// ------------------------------------------------------------------ versions (duplicate / delete sequences)
+tool("pr_duplicate_sequence", {
+  title: "Duplicate sequence (new version)",
+  description: "Copy a sequence before changing it, like After Effects' 'Comp v2': the copy is named '<name> v2' (next free vN; or give name) and the original stays the active sequence unless activate: true. Use it as the undo point before a batch of edits; pr_remove_sequence deletes versions again.",
+  inputSchema: { sequence: Seq, name: z.string().optional().describe("name for the copy; default next '<name> vN'"), activate: z.boolean().optional().describe("make the copy the active sequence (default: keep the original active)"), project: Project, dry_run: DryRun },
+}, async (a) => text(await call("duplicateSequence", { sequence: a.sequence, name: a.name, activate: a.activate, project: a.project, dryRun: a.dry_run }, { timeoutMs: 120000 })));
+
+tool("pr_remove_sequence", {
+  title: "Delete sequence (versions only)",
+  description: "Delete a sequence from the project. Refuses anything not named '<name> vN' or '<name> Copy' (the versions these tools create) unless force: true. Media stays in the project.",
+  inputSchema: { sequence: Seq, force: z.boolean().optional().describe("delete even if the name is not a version"), project: Project, dry_run: DryRun },
+}, async (a) => text(await call("deleteSequence", { sequence: a.sequence, force: a.force, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+// ------------------------------------------------------------------ markers / range
+const MarkerColor = z.union([z.number().int(), z.string()]).optional().describe("0-7 or green/red/purple/orange/yellow/white/blue/cyan");
+
+tool("pr_list_markers", {
+  title: "List sequence markers",
+  description: "Sequence markers in time order: index, guid, name, comments, type (Comment/Chapter/Segmentation/WebLink), start/end/duration (seconds + frames + timecode), color. Optional time range and name/comment filter. (Clip markers are not covered.)",
+  inputSchema: { sequence: Seq, from_frame: z.number().optional(), from_seconds: z.number().optional(), to_frame: z.number().optional(), to_seconds: z.number().optional(), filter: z.string().optional().describe("substring of name or comments"), project: Project },
+  annotations: { readOnlyHint: true },
+}, async (a) => text(await call("listMarkers", { sequence: a.sequence, fromFrame: a.from_frame, fromSeconds: a.from_seconds, toFrame: a.to_frame, toSeconds: a.to_seconds, filter: a.filter, project: a.project }, { timeoutMs: 60000 })));
+
+tool("pr_add_marker", {
+  title: "Add sequence marker",
+  description: "Add a sequence marker at a frame/second, optionally with an end (or duration), name, comments, type (comment default, chapter, segmentation, weblink with url) and color.",
+  inputSchema: {
+    sequence: Seq, start_frame: z.number().optional(), start_seconds: z.number().optional(),
+    end_frame: z.number().optional(), end_seconds: z.number().optional(), duration_frames: z.number().optional(), duration_seconds: z.number().optional(),
+    name: z.string().optional(), comments: z.string().optional(), type: z.enum(["comment", "chapter", "segmentation", "weblink"]).optional(), url: z.string().optional(), frame_target: z.string().optional(),
+    color: MarkerColor, project: Project, dry_run: DryRun,
+  },
+}, async (a) => text(await call("addMarker", { sequence: a.sequence, startFrame: a.start_frame, startSeconds: a.start_seconds, endFrame: a.end_frame, endSeconds: a.end_seconds, durationFrames: a.duration_frames, durationSeconds: a.duration_seconds, name: a.name, comments: a.comments, type: a.type, url: a.url, frameTarget: a.frame_target, color: a.color, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+tool("pr_remove_markers", {
+  title: "Remove sequence markers",
+  description: "Remove sequence markers by guid, index, time range (from/to frame or seconds), name/comment filter, or all: true. Criteria combine (AND). dry_run lists what would go.",
+  inputSchema: { sequence: Seq, guids: z.array(z.string()).optional(), indexes: z.array(z.number().int()).optional(), from_frame: z.number().optional(), from_seconds: z.number().optional(), to_frame: z.number().optional(), to_seconds: z.number().optional(), filter: z.string().optional(), all: z.boolean().optional(), project: Project, dry_run: DryRun },
+}, async (a) => text(await call("removeMarkers", { sequence: a.sequence, guids: a.guids, indexes: a.indexes, fromFrame: a.from_frame, fromSeconds: a.from_seconds, toFrame: a.to_frame, toSeconds: a.to_seconds, filter: a.filter, all: a.all, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+tool("pr_sequence_range", {
+  title: "Sequence in/out points and work area",
+  description: "Read (no arguments) or set a sequence's in/out points and work area. In/out points are what pr_render range: inout uses and set reliably. Premiere 26.5's scripting API accepts work-area changes but does not apply them; the result's notes say so when that happens, so prefer in/out points.",
+  inputSchema: { sequence: Seq, in_frame: z.number().optional(), in_seconds: z.number().optional(), out_frame: z.number().optional(), out_seconds: z.number().optional(), work_area_in_frame: z.number().optional(), work_area_in_seconds: z.number().optional(), work_area_out_frame: z.number().optional(), work_area_out_seconds: z.number().optional(), work_area_enabled: z.boolean().optional(), project: Project, dry_run: DryRun },
+}, async (a) => text(await call("sequenceRange", { sequence: a.sequence, inFrame: a.in_frame, inSeconds: a.in_seconds, outFrame: a.out_frame, outSeconds: a.out_seconds, workAreaInFrame: a.work_area_in_frame, workAreaInSeconds: a.work_area_in_seconds, workAreaOutFrame: a.work_area_out_frame, workAreaOutSeconds: a.work_area_out_seconds, workAreaEnabled: a.work_area_enabled, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
 
 // ------------------------------------------------------------------ build / compare
 function normName(s) { return String(s || "").replace(/\.[^.]+$/, "").toLowerCase(); }

@@ -29,7 +29,7 @@ node test/selftest.mjs            # add --no-render to skip the render step, --k
 node test/selftest.mjs --ae "/path/project.aep" --comp "Comp name"   # also tests a live Dynamic Link import
 ```
 
-It drives the real MCP server and exercises **every tool** (30/30): two scratch projects, imports, a sequence from a clip, single and batch placement, replace / move / enable / remove, track ops, frame exports + contact sheet, a direct render, scripting helpers, explicit project resolution with two projects open, `pr_build_from_timeline` (import + create + place, then an idempotent patch), `pr_compare_sequences`, and a real modal dialog raised in Premiere that `pr_status` detects and `pr_dismiss_dialog` clicks away.
+It drives the real MCP server and exercises **every tool** (36/36): two scratch projects, imports, a sequence from a clip, single and batch placement, replace / move / enable / remove, track ops, sequence versions (`v2` / `v3`, then deleted), markers (add, list, remove), in/out points, frame exports + contact sheet, a direct render, scripting helpers, explicit project resolution with two projects open, `pr_build_from_timeline` (import + create + place, then an idempotent patch), `pr_compare_sequences`, and a real modal dialog raised in Premiere that `pr_status` detects and `pr_dismiss_dialog` clicks away.
 
 ## Tools
 
@@ -50,6 +50,9 @@ Every tool accepts an optional `project` (name or `.prproj` path) and, where it 
 | `pr_set_track_enabled` / `pr_track` / `pr_add_tracks` | Track output/lock, rename, target; append tracks |
 | `pr_build_from_timeline` | Build or patch a sequence from JSON (imports missing media / AE comps first); `dry_run` reports every import/remove/place |
 | `pr_compare_sequences` | Clip-by-clip diff of two sequences (any two projects): source, start/end/in/out frames, enabled |
+| `pr_duplicate_sequence` / `pr_remove_sequence` | Copy a sequence as `<name> v2` (next free `vN`) before a batch of edits, original stays active; delete such versions (refuses other names unless `force`) |
+| `pr_list_markers` / `pr_add_marker` / `pr_remove_markers` | Sequence markers: list (time range / name filter), add (point or range, name, comments, comment/chapter/segmentation/weblink, color), remove by guid / index / range / filter / all |
+| `pr_sequence_range` | Read or set in/out points (what `pr_render range: inout` uses). Work-area setters are accepted but not applied by Premiere 26.5; the result's `notes` say so |
 | `pr_export_frame` / `pr_export_frames` / `pr_show_frame` | PNG(s) to disk (with contact sheet) / inline image |
 | `pr_list_export_presets` / `pr_render` | Find `.epr` presets; render via Media Encoder (jobId) or `mode: direct` (waits) |
 | `pr_run_script` | ExtendScript with helpers `getProject`, `getSequence(project, seq)`, `findItem`, `findBin`, `qeSequence`, `makeTime`, `timeInfo`, `log` |
@@ -78,6 +81,8 @@ Every tool accepts an optional `project` (name or `.prproj` path) and, where it 
 - **Premiere 26 quirks handled:** `qe.project.getSequenceAt()` throws for some indices (guarded, guid-matched, active-sequence fallback); QE `exportFramePNG` appends `.png` itself; `encodeSequence` needs an absolute `.epr`; `$.fileName` is empty in panels (host.jsx loaded from an absolute path); the engine may lack `JSON` (own serializer); `openDocument` returns false for an already-open project but activates it; `importAEComps` must be given a target bin (it silently does nothing otherwise).
 - **Active project:** with several projects open `app.project` is whichever Premiere last activated. Every tool's `project` parameter activates the named project first; in `pr_run_script` use `getSequence(project, seq)`.
 - **Audio of AE comps:** Dynamic Link items carry a silent audio stream, so a plain placement puts audio on the audio track (and Premiere may add tracks). `video_only: true` removes those audio clips right after placement. Premiere's API cannot move a clip to another track, so `target_audio_track_index` can only warn.
+- **Work area:** `setWorkAreaInPoint/OutPoint` (DOM) and QE's `setWorkInOutPoints` return success on Premiere 26.5 but leave the work area unchanged; `pr_sequence_range` tries both, verifies, and reports it in `notes`. Sequence in/out points do work, and `pr_render range: inout` uses them.
+- **Versions:** `Sequence.clone()` names the copy `<name> Copy` and makes it active; `pr_duplicate_sequence` renames it to the next `vN` and restores the active sequence. `Project.deleteSequence` works; `ProjectItem.deleteBin` on a sequence item reports success but deletes nothing.
 - **Not possible through Premiere's API** (so not offered): source-patching a project item's channels, deleting tracks (removing empty audio tracks is attempted through QE), renaming tracks on versions whose `Track.name` is read-only (reported in `notes`).
 - **Dialogs:** Premiere's normal windows are invisible to Accessibility, but its modal dialogs are exposed (subrole `AXDialog`), so detection and button clicks are reliable once Accessibility is granted.
 - **Nothing is saved implicitly.** Only `pr_save_project` / `pr_save_as` write the project.
