@@ -28,6 +28,8 @@ from a JSON timeline (importing missing media / AE comps first). pr_compare_sequ
 Versions: pr_duplicate_sequence copies a sequence as "<name> v2" before a batch of edits (the undo point); pr_remove_sequence
 deletes such versions. Markers: pr_list_markers / pr_add_marker / pr_remove_markers (sequence markers). pr_sequence_range reads or
 sets in/out points (work-area changes are accepted but not applied by Premiere 26.5; the result says so).
+Looking at an edit: pr_review_sheet returns one labelled contact sheet of a whole sequence (evenly spaced, at clip starts or at markers) plus a
+per-frame summary; pr_show_frame shows one frame. pr_detect_shots finds cuts in a media file with ffmpeg (optionally adding Shot N markers).
 pr_run_script runs raw ExtendScript with helpers: getProject(nameOrPath), getSequence(project, nameOrId), findItem(ref),
 findBin(path, create), qeSequence(seq), makeTime(sec), timeInfo(t, seq), log(...) (collected into "output").`;
 
@@ -51,9 +53,10 @@ async function contactSheet(pngs, outPath, { cols, width = 480, labels } = {}) {
   const n = pngs.length, c = cols || Math.min(4, Math.ceil(Math.sqrt(n))), r = Math.ceil(n / c);
   const args = [];
   pngs.forEach((p) => args.push("-i", p));
-  const scaled = pngs.map((_, i) => `[${i}:v]scale=${width}:-2,pad=${width}:ih+28:0:0:color=black${labels ? `,drawtext=text='${String(labels[i]).replace(/[':\\]/g, " ")}':x=6:y=h-22:fontsize=16:fontcolor=white` : ""}[s${i}]`).join(";");
+  const scaled = pngs.map((_, i) => `[${i}:v]scale=${width}:-2,pad=${width}:ih+28:0:0:color=black${labels ? `,drawtext=text='${String(labels[i]).replace(/['\\]/g, " ").replace(/([:;,\[\]=%])/g, "\\$1")}':x=6:y=h-22:fontsize=16:fontcolor=white` : ""}[s${i}]`).join(";");
   const inputs = pngs.map((_, i) => `[s${i}]`).join("");
-  args.push("-filter_complex", `${scaled};${inputs}xstack=inputs=${n}:layout=${pngs.map((_, i) => `${(i % c)}_${Math.floor(i / c)}`).map((pos) => pos.split("_").map((v, k) => (k === 0 ? `${Number(v) === 0 ? 0 : `w0*${v}`}` : `${Number(v) === 0 ? 0 : `h0*${v}`}`)).join("_")).join("|")}:fill=black[out]`, "-map", "[out]", "-y", outPath);
+  const sum = (dim, n) => (n === 0 ? "0" : Array(n).fill(dim).join("+"));   // xstack only understands sums (w0+w0), not products
+  args.push("-filter_complex", `${scaled};${inputs}xstack=inputs=${n}:layout=${pngs.map((_, i) => `${sum("w0", i % c)}_${sum("h0", Math.floor(i / c))}`).join("|")}:fill=black[out]`, "-map", "[out]", "-y", outPath);
   try { await run(ff, args, { timeout: 120000 }); return outPath; }
   catch (e) {
     // xstack is picky about uneven grids; fall back to tile (needs equal sizes, which scale gives us).
@@ -437,6 +440,137 @@ tool("pr_show_frame", {
   const data = (await fs.readFile(small)).toString("base64");
   fs.rm(r.path, { force: true }).catch(() => {}); fs.rm(small, { force: true }).catch(() => {});
   return { content: [{ type: "image", data, mimeType: "image/png" }, { type: "text", text: `frame ${r.frame} (${r.seconds}s, ${r.timecode})` }] };
+});
+
+// ------------------------------------------------------------------ analysis: shot detection / review sheet
+function tcOf(seconds, fps) {
+  const drop = Math.abs(fps - 29.97) < 0.01 || Math.abs(fps - 59.94) < 0.01, rf = Math.round(fps);
+  const total = Math.round(seconds * fps), f = total % rf, s = Math.floor(total / rf);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}${drop ? ";" : ":"}${p(f)}`;
+}
+const mediaTime = (seconds, fps) => ({ seconds: Math.round(seconds * 1000) / 1000, frames: Math.round(seconds * fps), timecode: tcOf(seconds, fps) });
+async function ffprobePath() {
+  if (process.env.FFPROBE) return process.env.FFPROBE;
+  const ff = await ffmpegPath(); if (!ff) return null;
+  const c = path.isAbsolute(ff) ? path.join(path.dirname(ff), "ffprobe") : "ffprobe";
+  try { await run(c, ["-version"], { timeout: 5000 }); return c; } catch { return null; }
+}
+async function probeVideo(file) {
+  const fp = await ffprobePath(); if (!fp) return { fps: null, duration: null };
+  const { stdout } = await run(fp, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate,avg_frame_rate,nb_frames,width,height:format=duration", "-of", "json", file], { timeout: 60000 });
+  const j = JSON.parse(stdout), st = j.streams?.[0] || {};
+  const rate = (s) => { if (!s) return null; const [n, d] = String(s).split("/").map(Number); return d ? n / d : n; };
+  const fps = rate(st.avg_frame_rate) || rate(st.r_frame_rate) || null;
+  return { fps: fps ? Math.round(fps * 1000) / 1000 : null, duration: j.format?.duration ? Number(j.format.duration) : null, size: st.width ? [st.width, st.height] : undefined, nbFrames: st.nb_frames ? Number(st.nb_frames) : undefined };
+}
+// Resolve a project item (id or name) to its media path through the panel.
+async function mediaPathOf(item, project) {
+  const r = await call("listItems", { project, durations: false }, { timeoutMs: 120000 });
+  const key = String(item);
+  const hit = r.items.find((i) => String(i.id) === key) || r.items.filter((i) => i.name === key)[0] || r.items.filter((i) => String(i.name).toLowerCase() === key.toLowerCase())[0];
+  if (!hit) throw new Error(`project item '${item}' not found (pr_list_items shows ids and names)`);
+  if (!hit.mediaPath) throw new Error(`project item '${hit.name}' has no media path (type ${hit.type})`);
+  if (hit.offline) throw new Error(`project item '${hit.name}' is offline: ${hit.mediaPath}`);
+  return { path: hit.mediaPath, item: { id: hit.id, name: hit.name } };
+}
+
+tool("pr_detect_shots", {
+  title: "Detect shots (scene changes)",
+  description: "Find cuts in a media file with ffmpeg scene-change detection (select='gt(scene,threshold)' + showinfo, server-side; Premiere is only used to resolve a project item to its media path). Give item (project item id or name) or path. Returns cut points as seconds + frames (at the media's fps from ffprobe) + timecode, the shots between them, the ffmpeg command used and the total shot count. threshold 0-1 (default 0.3; lower finds more cuts), min_shot_seconds merges cuts closer than that to the previous kept cut, limit caps the cuts. add_markers: true adds a sequence marker per shot start ('Shot N', Shot 1 at time 0) on sequence, shifted by marker_offset_seconds / marker_offset_frame when the media sits later in the timeline (dry_run plans them instead).",
+  inputSchema: {
+    item: z.union([z.string(), z.number()]).optional().describe("project item id or name (resolved to its media path)"), path: z.string().optional().describe("media file path (instead of item)"),
+    threshold: z.number().min(0).max(1).optional(), min_shot_seconds: z.number().min(0).optional(), limit: z.number().int().positive().optional(),
+    add_markers: z.boolean().optional(), sequence: Seq, marker_color: MarkerColor, marker_offset_seconds: z.number().optional(), marker_offset_frame: z.number().optional(), marker_name: z.string().optional().describe("default 'Shot {n}'"),
+    project: Project, dry_run: DryRun,
+  },
+}, async (a) => {
+  const ff = await ffmpegPath(); if (!ff) throw new Error("ffmpeg not found (install it with Homebrew or set FFMPEG)");
+  let file = a.path, item;
+  if (!file) { if (a.item === undefined) throw new Error("give item or path"); ({ path: file, item } = await mediaPathOf(a.item, a.project)); }
+  try { await fs.access(file); } catch { throw new Error(`media file not found: ${file}`); }
+  const threshold = a.threshold ?? 0.3;
+  const probe = await probeVideo(file);
+  const fps = probe.fps || 30;
+  const args = ["-nostats", "-hide_banner", "-i", file, "-vf", `select='gt(scene,${threshold})',metadata=print,showinfo`, "-an", "-f", "null", "-"];
+  const command = [ff, ...args].map((s) => (/[\s'"]/.test(s) ? JSON.stringify(s) : s)).join(" ");
+  let stderr = "";
+  try { ({ stderr } = await run(ff, args, { timeout: 1800000, maxBuffer: 256 * 1024 * 1024 })); }
+  catch (e) { throw new Error(`ffmpeg failed: ${(e.stderr || e.message).split("\n").filter(Boolean).slice(-3).join(" | ")}`); }
+  // showinfo gives one line per selected frame; metadata=print adds the scene score for the same pts_time.
+  const scores = new Map(); let lastT = null;
+  for (const line of stderr.split("\n")) {
+    const m = /Parsed_metadata.*pts_time:([\d.]+)/.exec(line); if (m) { lastT = m[1]; continue; }
+    const s = /lavfi\.scene_score=([\d.]+)/.exec(line); if (s && lastT !== null) scores.set(lastT, Number(s[1]));
+  }
+  let raw = [];
+  for (const line of stderr.split("\n")) { const m = /Parsed_showinfo.*\bpts_time:([\d.]+)/.exec(line); if (m) raw.push({ t: Number(m[1]), score: scores.get(m[1]) }); }
+  raw.sort((x, y) => x.t - y.t);
+  const minGap = a.min_shot_seconds ?? 0, cuts = []; let merged = 0, prev = 0;
+  for (const c of raw) { if (c.t <= 0) continue; if (c.t - prev < minGap) { merged++; continue; } cuts.push(c); prev = c.t; }
+  const dropped = a.limit && cuts.length > a.limit ? cuts.length - a.limit : 0; if (dropped) cuts.length = a.limit;
+  const duration = probe.duration ?? (cuts.length ? cuts[cuts.length - 1].t : 0);
+  const starts = [0, ...cuts.map((c) => c.t)];
+  const shots = starts.map((s, i) => { const e = i + 1 < starts.length ? starts[i + 1] : duration; return { index: i + 1, start: mediaTime(s, fps), end: mediaTime(e, fps), duration: mediaTime(e - s, fps) }; });
+  const res = { source: file, item, fps, duration: mediaTime(duration, fps), threshold, minShotSeconds: minGap, command, totalShots: shots.length, cuts: cuts.map((c) => ({ ...mediaTime(c.t, fps), score: c.score })), shots };
+  if (merged) res.mergedCuts = merged; if (dropped) res.droppedByLimit = dropped;
+  if (a.add_markers) {
+    let offset = a.marker_offset_seconds ?? 0;
+    if (a.marker_offset_frame !== undefined) { const s = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 60000 }); offset = a.marker_offset_frame / s.fps; }
+    const tmpl = a.marker_name || "Shot {n}"; res.markers = [];
+    for (const sh of shots) {
+      const name = tmpl.replace("{n}", String(sh.index)), startSeconds = Math.round((offset + sh.start.seconds) * 10000) / 10000;
+      const r = await call("addMarker", { sequence: a.sequence, startSeconds, name, comments: `shot ${sh.index}: ${sh.start.timecode} → ${sh.end.timecode} in ${path.basename(file)}`, color: a.marker_color, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 });
+      res.markers.push(a.dry_run ? { dryRun: true, name, start: r.plan.start } : { name: r.marker.name, guid: r.marker.guid, start: r.marker.start, color: r.marker.color });
+    }
+    if (a.dry_run) res.dryRun = true;
+  }
+  return text(res);
+});
+
+tool("pr_review_sheet", {
+  title: "Review sheet (contact sheet of a sequence)",
+  description: "One-call look at a whole edit: exports frames of a sequence (count evenly spaced, default 12; or at_clip_starts: true for every video clip start; or at_markers: true for every sequence marker; or explicit frames / seconds), tiles them into a labelled contact sheet (label = timecode + clip name at that time; needs ffmpeg) and returns it inline as an image plus a per-frame text summary: timecode, clip on the topmost enabled video track, markers at that time. out_path keeps the full-size sheet on disk.",
+  inputSchema: {
+    sequence: Seq, count: z.number().int().min(1).max(60).optional(), at_clip_starts: z.boolean().optional(), at_markers: z.boolean().optional(), frames: z.array(z.number()).optional(), seconds: z.array(z.number()).optional(),
+    columns: z.number().int().positive().optional(), tile_width: z.number().int().positive().optional().describe("pixels per tile, default 480"), max_size: z.number().int().positive().optional().describe("longest side of the returned image, default 1600"),
+    out_path: z.string().optional(), project: Project,
+  },
+  annotations: { readOnlyHint: true },
+}, async (a) => {
+  if (!(await ffmpegPath())) throw new Error("ffmpeg not found (install it with Homebrew or set FFMPEG)");
+  const s = await call("getSequence", { sequence: a.sequence, project: a.project }, { timeoutMs: 120000 });
+  const fps = s.fps, endSec = s.end.seconds;
+  const video = s.tracks.filter((t) => t.type === "video");
+  let times = [], mode;
+  if (a.frames?.length || a.seconds?.length) { mode = "explicit"; times = (a.frames || []).map((f) => f / fps).concat(a.seconds || []); }
+  else if (a.at_clip_starts) { mode = "clip starts"; for (const t of video) for (const c of t.clips) times.push(c.start.seconds); }
+  else if (a.at_markers) { mode = "markers"; const m = await call("listMarkers", { sequence: a.sequence, project: a.project }, { timeoutMs: 60000 }); times = m.markers.map((x) => x.start.seconds); if (!times.length) throw new Error("the sequence has no markers"); }
+  else { mode = "evenly spaced"; const n = a.count ?? 12; for (let i = 0; i < n; i++) times.push((endSec * i) / n); }
+  times = [...new Set(times.map((t) => Math.round(t * fps) / fps))].filter((t) => t >= 0 && t <= endSec).sort((x, y) => x - y);
+  if (!times.length) throw new Error("no frames to show (empty sequence?)");
+  if (times.length > 60) throw new Error(`${times.length} frames is too many for one sheet (max 60); use count / frames to narrow`);
+  const markers = (await call("listMarkers", { sequence: a.sequence, project: a.project }, { timeoutMs: 60000 }).catch(() => ({ markers: [] }))).markers;
+  const half = 0.5 / fps;
+  const clipAt = (t) => { let off = null; for (let i = video.length - 1; i >= 0; i--) { const c = video[i].clips.find((c) => c.start.seconds - half <= t && t < c.end.seconds - half); if (!c) continue; if (video[i].enabled !== false && c.enabled !== false) return { name: c.name, track: `V${i + 1}` }; off = off || { name: `${c.name} (disabled)`, track: `V${i + 1}` }; } return off; };
+  const markersAt = (t) => markers.filter((m) => m.start.seconds - half <= t && t <= Math.max(m.end.seconds, m.start.seconds) + half).map((m) => m.name || m.comments || m.type);
+  const dir = path.join(os.tmpdir(), "premiere-bridge-review", Date.now().toString(36)); await fs.mkdir(dir, { recursive: true });
+  const rows = [];
+  for (const [i, t] of times.entries()) {
+    const r = await call("exportFrame", { sequence: a.sequence, seconds: t, path: path.join(dir, `f${String(i).padStart(3, "0")}.png`), project: a.project }, { timeoutMs: 60000 });
+    const clip = clipAt(t), ms = markersAt(t);
+    rows.push({ index: i + 1, seconds: r.seconds, frame: r.frame, timecode: r.timecode, clip: clip?.name ?? null, track: clip?.track, markers: ms, png: r.path });
+  }
+  const sheet = await contactSheet(rows.map((r) => r.png), a.out_path || path.join(dir, "sheet.png"), { cols: a.columns, width: a.tile_width ?? 480, labels: rows.map((r) => `${r.index}. ${r.timecode} ${r.clip ?? "(empty)"}`) });
+  if (!sheet) throw new Error("ffmpeg could not build the contact sheet");
+  const small = path.join(dir, "sheet-small.png");
+  await run("/usr/bin/sips", ["-Z", String(a.max_size ?? 1600), sheet, "--out", small]);
+  const data = (await fs.readFile(small)).toString("base64");
+  const lines = [`${s.name}: ${rows.length} frames (${mode}), ${s.end.timecode} long, ${fps} fps${a.out_path ? `, sheet: ${sheet}` : ""}`];
+  for (const r of rows) lines.push(`${String(r.index).padStart(2)}. ${r.timecode} (f${r.frame})  ${r.clip ? `${r.clip} [${r.track}]` : "(no clip)"}${r.markers.length ? `  markers: ${r.markers.join(", ")}` : ""}`);
+  const gaps = rows.filter((r) => !r.clip).length; if (gaps) lines.push(`${gaps} of the sampled frames show no enabled video clip.`);
+  fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  return { content: [{ type: "image", data, mimeType: "image/png" }, { type: "text", text: lines.join("\n") }] };
 });
 
 const AME_DIRS = () => [

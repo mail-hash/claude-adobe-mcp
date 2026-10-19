@@ -29,7 +29,7 @@ node test/selftest.mjs            # add --no-render to skip the render step, --k
 node test/selftest.mjs --ae "/path/project.aep" --comp "Comp name"   # also tests a live Dynamic Link import
 ```
 
-It drives the real MCP server and exercises **every tool** (36/36): two scratch projects, imports, a sequence from a clip, single and batch placement, replace / move / enable / remove, track ops, sequence versions (`v2` / `v3`, then deleted), markers (add, list, remove), in/out points, frame exports + contact sheet, a direct render, scripting helpers, explicit project resolution with two projects open, `pr_build_from_timeline` (import + create + place, then an idempotent patch), `pr_compare_sequences`, and a real modal dialog raised in Premiere that `pr_status` detects and `pr_dismiss_dialog` clicks away.
+It drives the real MCP server and exercises **every tool** (38/38): two scratch projects, imports, a sequence from a clip, single and batch placement, replace / move / enable / remove, track ops, sequence versions (`v2` / `v3`, then deleted), markers (add, list, remove), shot detection on a generated two-colour mp4 (cut found at 1 s, `Shot N` markers added and removed), in/out points, frame exports + contact sheet, review sheets (evenly spaced and at clip starts), a direct render, scripting helpers, explicit project resolution with two projects open, `pr_build_from_timeline` (import + create + place, then an idempotent patch), `pr_compare_sequences`, and a real modal dialog raised in Premiere that `pr_status` detects and `pr_dismiss_dialog` clicks away.
 
 ## Tools
 
@@ -54,6 +54,8 @@ Every tool accepts an optional `project` (name or `.prproj` path) and, where it 
 | `pr_list_markers` / `pr_add_marker` / `pr_remove_markers` | Sequence markers: list (time range / name filter), add (point or range, name, comments, comment/chapter/segmentation/weblink, color), remove by guid / index / range / filter / all |
 | `pr_sequence_range` | Read or set in/out points (what `pr_render range: inout` uses). Work-area setters are accepted but not applied by Premiere 26.5; the result's `notes` say so |
 | `pr_export_frame` / `pr_export_frames` / `pr_show_frame` | PNG(s) to disk (with contact sheet) / inline image |
+| `pr_review_sheet` | One labelled contact sheet of a whole sequence, inline: N evenly spaced frames (default 12), or every clip start (`at_clip_starts`), or every marker (`at_markers`), or explicit frames; text summary per frame (timecode, clip on the topmost enabled video track, markers). Needs ffmpeg |
+| `pr_detect_shots` | ffmpeg scene-change detection on a project item (by id/name → media path) or a file: cuts as seconds + frames (media fps via ffprobe) + timecode, shots, the ffmpeg command used; `threshold`, `min_shot_seconds`, `limit`; `add_markers` adds a `Shot N` sequence marker per shot (color, timeline offset, `dry_run`) |
 | `pr_list_export_presets` / `pr_render` | Find `.epr` presets; render via Media Encoder (jobId) or `mode: direct` (waits) |
 | `pr_run_script` | ExtendScript with helpers `getProject`, `getSequence(project, seq)`, `findItem`, `findBin`, `qeSequence`, `makeTime`, `timeInfo`, `log` |
 
