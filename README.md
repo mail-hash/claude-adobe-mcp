@@ -8,7 +8,7 @@ Built against After Effects 2026 (26.5) and Premiere Pro 2026 (26.5) on Apple Si
 |---|---|
 | [`AE Claude MCP/`](AE%20Claude%20MCP) | **After Effects Round Trip** — Claude Desktop extension (27 tools). Exports a comp tree to JSON with stable layer IDs, applies edits as a new version of the comp, runs ExtendScript with a helper library, applies animation presets and lints expressions, renders comps (batch, background jobs) and frames, compares renders against references (PSNR/SSIM), lists/replaces fonts, detects and dismisses AE's modal dialogs. |
 | [`AE Round Trip/`](AE%20Round%20Trip) | The ExtendScript side of the AE extension, also usable on its own from **File › Scripts**: `Export Comp.jsx`, `Apply Changes.jsx`, `Rebuild Comp.jsx` plus the MCP helper scripts. Everything is function-scoped; no built-in prototypes are touched. |
-| [`Premiere Claude MCP/`](Premiere%20Claude%20MCP) | **Premiere Pro Bridge** — a CEP 12 panel that runs a localhost-only HTTP server inside Premiere, plus the Claude Desktop extension that talks to it (39 tools): projects, imports (incl. Dynamic Link of many AE comps in one call), sequences built or patched from a JSON timeline, sequence versions (`v2`, `v3`…), markers, in/out points, clip and track operations, sequence diffing, frame export, rendering through Media Encoder, dialog detection/dismissal, raw ExtendScript. |
+| [`Premiere Claude MCP/`](Premiere%20Claude%20MCP) | **Premiere Pro Bridge** — a CEP 12 panel that runs a localhost-only HTTP server inside Premiere, plus the Claude Desktop extension that talks to it (57 tools): projects, imports (incl. Dynamic Link of many AE comps in one call), sequences built or patched from a JSON timeline, sequence versions (`v2`, `v3`…), markers, in/out points, effects and keyframes, transitions, razor / trim / cross-track moves, local transcription and transcript-driven cuts, audio analysis / levels / ducking, Motion Graphics Templates, clip and track operations, sequence diffing, frame export, rendering through Media Encoder, dialog detection/dismissal, raw ExtendScript. |
 | [`research/premiere-mcp/EVALUATION.md`](research/premiere-mcp/EVALUATION.md) | Review of eight community Premiere MCP projects and why this one is its own CEP bridge. |
 
 ## What it does, in practice
@@ -31,7 +31,7 @@ Both servers are small Node processes (MCP over stdio). After Effects is driven 
 ## Status and limits
 
 - Tested on macOS (Apple Silicon) with AE 26.5 and Premiere 26.5.2 only. Claude Desktop only (the browser can't reach local apps).
-- Premiere's API has no way to move a clip between tracks, set source patching, or delete tracks; those come back as warnings. UXP was deliberately not used (its API is still behind CEP for timeline work).
+- Premiere's API has no way to set clip speed, set source patching, or delete tracks; those come back as warnings. UXP was deliberately not used (its API is still behind CEP for timeline work).
 - AE 26.5's scripting engine evaluates `"text" + object` with expression (vector-math) semantics and throws; the helper library's `str()` routes around it.
 
 MIT licensed. `Premiere Claude MCP/cep/js/CSInterface.js` is Adobe's CEP library, redistributed under Adobe's own license terms for it.

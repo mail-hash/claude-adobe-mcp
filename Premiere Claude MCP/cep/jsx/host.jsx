@@ -4,7 +4,7 @@
    Times: Premiere ticks are 254016000000 per second. All results carry seconds and frames. */
 // $.evalFile from inside a function would make a plain `var` local to that function; bind the namespace explicitly.
 $.global.CPB = (function () {
-    var C = { VERSION: "1.1.0" };
+    var C = { VERSION: "1.3.0" };
     var TICKS = 254016000000;
 
     // ---------------------------------------------------------------- JSON (own, prototype-free)
@@ -506,15 +506,28 @@ $.global.CPB = (function () {
         else if (a.toSeconds !== undefined && a.toSeconds !== null) target = Number(a.toSeconds);
         else if (a.deltaFrames !== undefined && a.deltaFrames !== null) target = cur + Number(a.deltaFrames) * seqFrameTicks(seq) / TICKS;
         else if (a.deltaSeconds !== undefined && a.deltaSeconds !== null) target = cur + Number(a.deltaSeconds);
-        else fail("give toFrame, toSeconds, deltaFrames or deltaSeconds");
+        else if (a.toTrackIndex !== undefined && a.toTrackIndex !== null) target = cur;
+        else fail("give toFrame, toSeconds, deltaFrames, deltaSeconds or toTrackIndex");
         if (target < 0) target = 0;
-        if (a.dryRun) return { dryRun: true, plan: { action: "moveClip", clip: clip.name, from: timeInfo(cur, seq), to: timeInfo(target, seq) } };
+        var toTrack = (a.toTrackIndex !== undefined && a.toTrackIndex !== null) ? Number(a.toTrackIndex) : null;
+        if (a.dryRun) return { dryRun: true, plan: { action: "moveClip", clip: clip.name, from: timeInfo(cur, seq), to: timeInfo(target, seq), toTrack: toTrack === null ? undefined : t.type + " " + toTrack } };
+        if (toTrack !== null && toTrack !== (Number(a.trackIndex) || 0)) {
+            var dest = trackList(seq, t.type); if (toTrack < 0 || toTrack >= dest.numTracks) fail("track " + toTrack + " doesn't exist (" + dest.numTracks + " " + t.type + " tracks)");
+            var qi = qeItemFor(seq, t.type, Number(a.trackIndex) || 0, clip);
+            var moved = false; try { moved = !!qi.item.moveToTrack(toTrack - (Number(a.trackIndex) || 0), 0, "0", false); } catch (eMT) { fail("moveToTrack failed: " + eMT.message); }
+            var onDest = clipAtStart(dest[toTrack], cur, seq);
+            if (!moved || !onDest || Math.abs(secondsOf(onDest.clip.start) - cur) > 0.002) fail("Premiere did not move the clip to " + t.type + " track " + toTrack + " (locked track, or another clip in the way?)");
+            t = { track: dest[toTrack], clip: onDest.clip, index: onDest.index, type: t.type }; clip = t.clip; a.trackIndex = toTrack;
+            if (target === cur) return { clip: clipInfo(clip, seq, t.type, toTrack, t.index), movedFrom: timeInfo(cur, seq), movedToTrack: t.type + " " + toTrack };
+        }
         var ok = false;
         try { clip.move(makeTime(target - cur)); ok = Math.abs(secondsOf(clip.start) - target) < 0.002; } catch (e) {}
         if (!ok) { try { clip.start = makeTime(target); clip.end = makeTime(target + dur); ok = Math.abs(secondsOf(clip.start) - target) < 0.002; } catch (e2) {} }
         if (!ok) fail("Premiere did not move the clip (another clip may be in the way in overwrite-free move).");
         var placed = clipAtStart(t.track, target, seq);
-        return { clip: clipInfo(placed.clip, seq, t.type, Number(a.trackIndex) || 0, placed.index), movedFrom: timeInfo(cur, seq) };
+        var res = { clip: clipInfo(placed.clip, seq, t.type, Number(a.trackIndex) || 0, placed.index), movedFrom: timeInfo(cur, seq) };
+        if (toTrack !== null) res.movedToTrack = t.type + " " + toTrack;
+        return res;
     };
     C.trackOp = function (a) {
         var seq = findSequence(a.sequence);
@@ -776,6 +789,375 @@ $.global.CPB = (function () {
         }
         var out = { sequence: { id: seq.sequenceID, name: seq.name }, range: rangeInfo(seq) };
         if (notes.length) out.notes = notes;
+        return out;
+    };
+
+    // ---------------------------------------------------------------- effects (clip components), via DOM + QE
+    // QE track items include gaps and transitions, so a DOM clip is matched to its QE item by start ticks, never by index.
+    function qeItemFor(seq, type, trackIndex, clip) {
+        var q = qeSequence(seq);
+        var qt = type === "audio" ? q.getAudioTrackAt(trackIndex) : q.getVideoTrackAt(trackIndex);
+        if (!qt) fail("QE can't address " + type + " track " + trackIndex);
+        var want = String(clip.start.ticks), tc = tcOf(secondsOf(clip.start), seqFps(seq));
+        for (var i = 0; i < qt.numItems; i++) { var it = qt.getItemAt(i); try { if (it.type === "Clip" && String(it.start.ticks) === want) return { track: qt, item: it }; } catch (e) {} }
+        for (var j = 0; j < qt.numItems; j++) { var it2 = qt.getItemAt(j); try { if (it2.type === "Clip" && String(it2.start.timecode) === tc) return { track: qt, item: it2 }; } catch (e2) {} }
+        fail("QE can't find clip '" + clip.name + "' at " + tc + " on " + type + " track " + trackIndex);
+    }
+    // Component keyframe times are in the clip's SOURCE time (stills start at 01:00:00:00), not sequence time.
+    function clipSpeedFactor(clip) { var sp = 1; try { sp = clip.getSpeed(); } catch (e) {} if (!sp) return 1; return sp > 10 ? sp / 100 : sp; }
+    function srcTime(clip, seqSeconds) { return secondsOf(clip.inPoint) + (seqSeconds - secondsOf(clip.start)) * clipSpeedFactor(clip); }
+    function seqTimeOf(clip, srcSeconds) { return secondsOf(clip.start) + (srcSeconds - secondsOf(clip.inPoint)) / clipSpeedFactor(clip); }
+    function propValue(pr) { var v = null; try { v = pr.getValue(); } catch (e) { try { v = pr.getColorValue(); } catch (e2) { v = null; } } return v; }
+    function componentInfo(comp, index, clip, seq, withKeys) {
+        var o = { index: index, name: comp.displayName, matchName: comp.matchName, properties: [] };
+        for (var p = 0; p < comp.properties.numItems; p++) {
+            var pr = comp.properties[p], pi = { index: p, name: pr.displayName, value: propValue(pr) };
+            try { pi.timeVarying = pr.isTimeVarying(); } catch (e) {}
+            if (pi.timeVarying && withKeys !== false) {
+                pi.keys = [];
+                try { var ks = pr.getKeys(); if (ks) for (var k = 0; k < ks.length; k++) { var kt = secondsOf(ks[k]); pi.keys.push({ time: timeInfo(seqTimeOf(clip, kt), seq), sourceSeconds: round(kt), value: pr.getValueAtKey(ks[k]) }); } } catch (e2) {}
+            }
+            o.properties.push(pi);
+        }
+        return o;
+    }
+    function findComponent(clip, ref) {
+        if (ref === undefined || ref === null || ref === "") fail("give component (name, matchName or index)");
+        if (typeof ref === "number" || /^\d+$/.test(String(ref))) { var i = Number(ref); if (i < 0 || i >= clip.components.numItems) fail("component index " + i + " out of range (clip has " + clip.components.numItems + ")"); return { comp: clip.components[i], index: i }; }
+        var r = String(ref).toLowerCase(), hits = [], c;
+        for (c = 0; c < clip.components.numItems; c++) { var comp = clip.components[c]; if (String(comp.displayName).toLowerCase() === r || String(comp.matchName).toLowerCase() === r) hits.push({ comp: comp, index: c }); }
+        if (!hits.length) for (c = 0; c < clip.components.numItems; c++) { var comp2 = clip.components[c]; if (String(comp2.displayName).toLowerCase().indexOf(r) >= 0) hits.push({ comp: comp2, index: c }); }
+        if (hits.length === 1) return hits[0];
+        if (hits.length > 1) fail("'" + ref + "' matches " + hits.length + " components; use the index from pr_get_clip_effects");
+        fail("component '" + ref + "' not found on clip '" + clip.name + "'");
+    }
+    function findProperty(comp, ref) {
+        if (ref === undefined || ref === null || ref === "") fail("give property (name or index)");
+        if (typeof ref === "number" || /^\d+$/.test(String(ref))) { var i = Number(ref); if (i < 0 || i >= comp.properties.numItems) fail("property index " + i + " out of range"); return { prop: comp.properties[i], index: i }; }
+        var r = String(ref).toLowerCase(), hits = [], p;
+        for (p = 0; p < comp.properties.numItems; p++) if (String(comp.properties[p].displayName).toLowerCase() === r) hits.push({ prop: comp.properties[p], index: p });
+        if (!hits.length) for (p = 0; p < comp.properties.numItems; p++) if (String(comp.properties[p].displayName).toLowerCase().indexOf(r) >= 0) hits.push({ prop: comp.properties[p], index: p });
+        if (hits.length === 1) return hits[0];
+        if (hits.length > 1) fail("'" + ref + "' matches " + hits.length + " properties of " + comp.displayName + "; use the index");
+        fail("property '" + ref + "' not found on " + comp.displayName);
+    }
+    function effectCatalog(type) { try { app.enableQE(); } catch (e) { fail("QE DOM unavailable"); } var list = type === "audio" ? qe.project.getAudioEffectList() : qe.project.getVideoEffectList(); var out = []; for (var i = 0; i < list.length; i++) out.push(String(list[i])); return out; }
+    function pickByName(list, ref, what) {
+        var r = String(ref), hits = [], i, seen = {};
+        for (i = 0; i < list.length; i++) if (list[i] === r) return list[i];
+        for (i = 0; i < list.length; i++) if (list[i].toLowerCase() === r.toLowerCase() && !seen[list[i]]) { hits.push(list[i]); seen[list[i]] = true; }
+        if (!hits.length) for (i = 0; i < list.length; i++) if (list[i].toLowerCase().indexOf(r.toLowerCase()) >= 0 && !seen[list[i]]) { hits.push(list[i]); seen[list[i]] = true; }
+        if (hits.length === 1) return hits[0];
+        if (hits.length > 1) fail("'" + ref + "' matches " + hits.length + " " + what + ": " + hits.slice(0, 8).join(", ") + (hits.length > 8 ? ", …" : ""));
+        fail(what + " '" + ref + "' not found");
+    }
+    C.getClipEffects = function (a) {
+        var seq = findSequence(a.sequence), t = findClipArg(seq, a);
+        var out = { clip: clipInfo(t.clip, seq, t.type, Number(a.trackIndex) || 0, t.index), components: [] };
+        for (var c = 0; c < t.clip.components.numItems; c++) {
+            var comp = t.clip.components[c];
+            if (a.component !== undefined && a.component !== null && a.component !== "") { var want = String(a.component).toLowerCase(); if (String(comp.displayName).toLowerCase().indexOf(want) < 0 && String(comp.matchName).toLowerCase() !== want && String(c) !== want) continue; }
+            out.components.push(componentInfo(comp, c, t.clip, seq, a.keys !== false));
+        }
+        return out;
+    };
+    C.listEffects = function (a) {
+        var all = effectCatalog(a.type), out = [], f = a.filter ? String(a.filter).toLowerCase() : null, seen = {};
+        for (var i = 0; i < all.length; i++) { if (seen[all[i]]) continue; seen[all[i]] = true; if (!f || all[i].toLowerCase().indexOf(f) >= 0) out.push(all[i]); }
+        return { type: a.type === "audio" ? "audio" : "video", total: all.length, effects: out };
+    };
+    C.addEffect = function (a) {
+        var seq = findSequence(a.sequence), t = findClipArg(seq, a);
+        if (!a.effect) fail("effect name is required (see pr_list_effects)");
+        var name = pickByName(effectCatalog(t.type), a.effect, t.type + " effects");
+        var fx = t.type === "audio" ? qe.project.getAudioEffectByName(name) : qe.project.getVideoEffectByName(name);
+        if (!fx) fail("QE returned no effect object for '" + name + "'");
+        if (a.dryRun) return { dryRun: true, plan: { action: "addEffect", clip: t.clip.name, effect: name } };
+        var before = t.clip.components.numItems;
+        var qi = qeItemFor(seq, t.type, Number(a.trackIndex) || 0, t.clip);
+        var ok = t.type === "audio" ? qi.item.addAudioEffect(fx) : qi.item.addVideoEffect(fx);
+        var comps = [];
+        for (var c = 0; c < t.clip.components.numItems; c++) comps.push({ index: c, name: t.clip.components[c].displayName, matchName: t.clip.components[c].matchName });
+        if (!ok || comps.length === before) fail("Premiere did not add '" + name + "' to '" + t.clip.name + "' (some effects don't apply to this clip type)");
+        var last = comps[comps.length - 1];
+        return { clip: t.clip.name, effect: name, added: comps.slice(before), components: comps, component: componentInfo(t.clip.components[last.index], last.index, t.clip, seq, false) };
+    };
+    C.setEffectProperty = function (a) {
+        var seq = findSequence(a.sequence), t = findClipArg(seq, a), clip = t.clip;
+        var fc = findComponent(clip, a.component), fp = findProperty(fc.comp, a.property), pr = fp.prop;
+        var before = propValue(pr), i;
+        function keyTime(k) { var sec = timeArg(k, "seconds", "frame", seq); if (sec === null) fail("each key needs frame or seconds (sequence time)"); return sec; }
+        var keys = (a.keys && a.keys.length) ? a.keys : null;
+        var plan = { action: "setEffectProperty", clip: clip.name, component: fc.comp.displayName, property: pr.displayName, before: before };
+        if (a.value !== undefined && a.value !== null) plan.value = a.value;
+        if (keys) { plan.keys = []; for (i = 0; i < keys.length; i++) plan.keys.push({ time: timeInfo(keyTime(keys[i]), seq), sourceSeconds: round(srcTime(clip, keyTime(keys[i]))), value: keys[i].value }); }
+        if (a.clearKeys) plan.clearKeys = true;
+        if (!keys && !a.clearKeys && (a.value === undefined || a.value === null)) fail("give value, keys, or clearKeys");
+        if (a.dryRun) return { dryRun: true, plan: plan };
+        if (a.clearKeys || keys) { try { if (pr.isTimeVarying()) { var ks = pr.getKeys(); if (ks) for (var r = ks.length - 1; r >= 0; r--) pr.removeKey(ks[r]); } } catch (e1) {} }
+        if (a.clearKeys && !keys) { try { pr.setTimeVarying(false); } catch (e2) {} }
+        if (a.value !== undefined && a.value !== null && !keys) {
+            try { if (pr.isTimeVarying()) pr.setTimeVarying(false); } catch (e3) {}
+            var isColor = false; try { isColor = (before === null || before === undefined) && isArray(a.value) && a.value.length >= 3; } catch (e4) {}
+            if (isColor) pr.setColorValue(a.value[0], a.value[1], a.value[2], a.value.length > 3 ? a.value[3] : 255, true); else pr.setValue(a.value, true);
+        }
+        if (keys) {
+            var supported = true; try { supported = pr.areKeyframesSupported(); } catch (e5) {}
+            if (!supported) fail("'" + pr.displayName + "' doesn't support keyframes");
+            pr.setTimeVarying(true);
+            for (i = 0; i < keys.length; i++) { var tt = makeTime(srcTime(clip, keyTime(keys[i]))); pr.addKey(tt); pr.setValueAtKey(tt, keys[i].value, true); }
+        }
+        var info = componentInfo(fc.comp, fc.index, clip, seq, true);
+        var out = { clip: clip.name, component: fc.comp.displayName, property: info.properties[fp.index], before: before };
+        if (/Opacity/.test(String(fc.comp.matchName))) out.note = "Opacity values read back but did not change exported frames in Premiere 26.5 tests; verify in the Program Monitor.";
+        return out;
+    };
+
+    // ---------------------------------------------------------------- transitions (QE adds, DOM lists/removes)
+    function transitionsOf(track, seq) {
+        var out = [], n = 0; try { n = track.transitions.numItems; } catch (e) {}
+        for (var i = 0; i < n; i++) {
+            var tr = track.transitions[i], o = { index: i };
+            try { o.name = tr.name; } catch (e1) {} try { o.nodeId = tr.nodeId; } catch (e2) {}
+            try { o.start = timeInfo(tr.start, seq); o.end = timeInfo(tr.end, seq); o.duration = timeInfo(secondsOf(tr.end) - secondsOf(tr.start), seq); } catch (e3) {}
+            out.push(o);
+        }
+        return out;
+    }
+    function transitionCatalog(type) { try { app.enableQE(); } catch (e) { fail("QE DOM unavailable"); } var list = type === "audio" ? qe.project.getAudioTransitionList() : qe.project.getVideoTransitionList(); var out = []; for (var i = 0; i < list.length; i++) out.push(String(list[i])); return out; }
+    C.listTransitions = function (a) {
+        if (a.catalog) {
+            var all = transitionCatalog(a.type), out = [], f = a.filter ? String(a.filter).toLowerCase() : null, seen = {};
+            for (var i = 0; i < all.length; i++) { if (seen[all[i]]) continue; seen[all[i]] = true; if (a.includeLegacy === false && /Legacy|Obsolete/.test(all[i])) continue; if (!f || all[i].toLowerCase().indexOf(f) >= 0) out.push(all[i]); }
+            return { type: a.type === "audio" ? "audio" : "video", total: all.length, transitions: out };
+        }
+        var seq = findSequence(a.sequence), type = a.trackType === "audio" ? "audio" : "video", idx = Number(a.trackIndex) || 0;
+        var track = requireTrack(seq, type, idx);
+        return { track: type + " " + idx, transitions: transitionsOf(track, seq) };
+    };
+    C.addTransition = function (a) {
+        var seq = findSequence(a.sequence), t = findClipArg(seq, a), idx = Number(a.trackIndex) || 0;
+        var name = pickByName(transitionCatalog(t.type), a.transition || "Cross Dissolve", t.type + " transitions");
+        var tr = t.type === "audio" ? qe.project.getAudioTransitionByName(name) : qe.project.getVideoTransitionByName(name);
+        if (!tr) fail("QE returned no transition object for '" + name + "'");
+        var dur = timeArg(a, "durationSeconds", "durationFrames", seq); if (dur === null) dur = 1;
+        var pos = a.position === "start" || a.position === "both" ? a.position : "end";
+        var tc = tcOf(dur, seqFps(seq));
+        if (a.dryRun) return { dryRun: true, plan: { action: "addTransition", clip: t.clip.name, transition: name, position: pos, duration: timeInfo(dur, seq) } };
+        var before = transitionsOf(t.track, seq).length;
+        var qi = qeItemFor(seq, t.type, idx, t.clip), results = [];
+        if (pos === "start" || pos === "both") results.push({ at: "start", ok: !!qi.item.addTransition(tr, true, tc) });
+        if (pos === "end" || pos === "both") results.push({ at: "end", ok: !!qi.item.addTransition(tr, false, tc) });
+        var after = transitionsOf(t.track, seq);
+        if (after.length === before) fail("Premiere did not add '" + name + "' (a transition needs handles on the clip; check in/out points)");
+        return { clip: t.clip.name, transition: name, position: pos, duration: timeInfo(dur, seq), added: after.length - before, transitions: after };
+    };
+    C.removeTransitions = function (a) {
+        var seq = findSequence(a.sequence), type = a.trackType === "audio" ? "audio" : "video", idx = Number(a.trackIndex) || 0;
+        var track = requireTrack(seq, type, idx), list = transitionsOf(track, seq), victims = [], i;
+        var at = timeArg(a, "atSeconds", "atFrame", seq);
+        var idxs = {}, hasIdx = false; if (a.indexes && a.indexes.length) { hasIdx = true; for (i = 0; i < a.indexes.length; i++) idxs[Number(a.indexes[i])] = true; }
+        if (!a.all && !hasIdx && at === null && !a.filter) fail("give indexes, atFrame/atSeconds, a name filter, or all: true");
+        for (i = 0; i < list.length; i++) {
+            var tr = list[i], hit = true;
+            if (hasIdx && !idxs[i]) hit = false;
+            if (at !== null && !(tr.start && tr.start.seconds <= at + 1e-6 && tr.end.seconds >= at - 1e-6)) hit = false;
+            if (a.filter && String(tr.name || "").toLowerCase().indexOf(String(a.filter).toLowerCase()) < 0) hit = false;
+            if (hit) victims.push(tr);
+        }
+        if (a.dryRun) return { dryRun: true, plan: { action: "removeTransitions", track: type + " " + idx, transitions: victims } };
+        for (i = victims.length - 1; i >= 0; i--) {
+            var obj = track.transitions[victims[i].index], ok = false;
+            try { obj.remove(false, false); ok = true; } catch (e1) { try { obj.remove(); ok = true; } catch (e2) {} }
+            if (!ok) fail("Premiere refused to remove transition '" + victims[i].name + "' at " + (victims[i].start ? victims[i].start.timecode : "?"));
+        }
+        return { removed: victims, remaining: transitionsOf(track, seq) };
+    };
+
+    // ---------------------------------------------------------------- split / trim (razor via QE, trims via DOM)
+    C.splitClip = function (a) {
+        var seq = findSequence(a.sequence), at = timeArg(a, "atSeconds", "atFrame", seq);
+        if (at === null) fail("give atFrame or atSeconds");
+        var tc = tcOf(at, seqFps(seq)), targets = [], i;
+        if (a.allTracks) { for (i = 0; i < seq.videoTracks.numTracks; i++) targets.push({ type: "video", index: i }); for (i = 0; i < seq.audioTracks.numTracks; i++) targets.push({ type: "audio", index: i }); }
+        else targets.push({ type: a.trackType === "audio" ? "audio" : "video", index: Number(a.trackIndex) || 0 });
+        if (a.dryRun) return { dryRun: true, plan: { action: "splitClip", at: timeInfo(at, seq), timecode: tc, tracks: targets } };
+        var q = qeSequence(seq), out = [];
+        for (i = 0; i < targets.length; i++) {
+            var tg = targets[i], track = trackList(seq, tg.type)[tg.index], before = track.clips.numItems, ok = false, err = null;
+            var hasClip = false; for (var c = 0; c < track.clips.numItems; c++) { var cl = track.clips[c]; if (secondsOf(cl.start) < at - 1e-6 && secondsOf(cl.end) > at + 1e-6) hasClip = true; }
+            if (!hasClip) { out.push({ track: tg.type + " " + tg.index, split: false, note: "no clip spans that time" }); continue; }
+            try { var qt = tg.type === "audio" ? q.getAudioTrackAt(tg.index) : q.getVideoTrackAt(tg.index); ok = !!qt.razor(tc); } catch (e) { err = e.message; }
+            out.push({ track: tg.type + " " + tg.index, split: ok && track.clips.numItems > before, clipsBefore: before, clipsAfter: track.clips.numItems, error: err || undefined });
+        }
+        return { at: timeInfo(at, seq), timecode: tc, tracks: out };
+    };
+    C.trimClip = function (a) {
+        var seq = findSequence(a.sequence), t = findClipArg(seq, a), clip = t.clip;
+        var s0 = secondsOf(clip.start), e0 = secondsOf(clip.end), i0 = secondsOf(clip.inPoint), o0 = secondsOf(clip.outPoint), sp = clipSpeedFactor(clip);
+        var ns = timeArg(a, "startSeconds", "startFrame", seq), ne = timeArg(a, "endSeconds", "endFrame", seq);
+        var ds = timeArg(a, "startDeltaSeconds", "startDeltaFrames", seq), de = timeArg(a, "endDeltaSeconds", "endDeltaFrames", seq);
+        if (ns === null && ds !== null) ns = s0 + ds; if (ne === null && de !== null) ne = e0 + de;
+        if (ns === null && ne === null) fail("give startFrame/startSeconds/startDeltaFrames and/or endFrame/endSeconds/endDeltaFrames");
+        if (ns === null) ns = s0; if (ne === null) ne = e0;
+        if (ne - ns < 1e-6) fail("end must be after start");
+        var ni = i0 + (ns - s0) * sp, no = o0 + (ne - e0) * sp;
+        if (ni < 0) fail("start trim would need media before the source's first frame (in point " + round(ni) + "s)");
+        var plan = { action: "trimClip", clip: clip.name, before: { start: timeInfo(s0, seq), end: timeInfo(e0, seq), inPoint: timeInfo(i0, seq), outPoint: timeInfo(o0, seq) }, after: { start: timeInfo(ns, seq), end: timeInfo(ne, seq), inPoint: timeInfo(ni, seq), outPoint: timeInfo(no, seq) } };
+        if (a.dryRun) return { dryRun: true, plan: plan };
+        // extending needs the source range first, shortening needs the timeline range first
+        if (ne > e0) { clip.outPoint = makeTime(no); clip.end = makeTime(ne); } else if (ne < e0) { clip.end = makeTime(ne); clip.outPoint = makeTime(no); }
+        if (ns < s0) { clip.inPoint = makeTime(ni); clip.start = makeTime(ns); } else if (ns > s0) { clip.start = makeTime(ns); clip.inPoint = makeTime(ni); }
+        var warnings = [];
+        if (Math.abs(secondsOf(clip.start) - ns) > 0.002 || Math.abs(secondsOf(clip.end) - ne) > 0.002) warnings.push("Premiere clamped the timeline range (another clip in the way, or no media handle)");
+        if (Math.abs(secondsOf(clip.inPoint) - ni) > 0.002 || Math.abs(secondsOf(clip.outPoint) - no) > 0.002) warnings.push("Premiere clamped the source range (not enough media)");
+        var placed = clipAtStart(t.track, secondsOf(clip.start), seq);
+        var out = { clip: clipInfo(placed.clip, seq, t.type, Number(a.trackIndex) || 0, placed.index), before: plan.before };
+        if (warnings.length) out.warnings = warnings;
+        return out;
+    };
+
+    // ---------------------------------------------------------------- audio levels (Volume > Level; Premiere stores 10^((dB-15)/20))
+    function dbToLevel(db) { return Math.pow(10, (db - 15) / 20); }
+    function levelToDb(v) { return v <= 0 ? -Infinity : 20 * Math.log(v) / Math.LN10 + 15; }
+    function levelProp(clip) {
+        for (var c = 0; c < clip.components.numItems; c++) {
+            var comp = clip.components[c];
+            if (!/Volume/i.test(String(comp.displayName)) && !/Volume/i.test(String(comp.matchName))) continue;
+            for (var p = 0; p < comp.properties.numItems; p++) if (/^Level$/i.test(String(comp.properties[p].displayName))) return { comp: comp, prop: comp.properties[p], compIndex: c, propIndex: p };
+        }
+        return null;
+    }
+    C.setClipVolume = function (a) {
+        a.trackType = "audio";
+        var seq = findSequence(a.sequence), t = findClipArg(seq, a), clip = t.clip;
+        var lp = levelProp(clip); if (!lp) fail("clip '" + clip.name + "' has no Volume > Level (not an audio clip?)");
+        var before = lp.prop.getValue(), beforeDb = round(levelToDb(before));
+        var keys = (a.keys && a.keys.length) ? a.keys : null, i;
+        function keyTime(k) { var sec = timeArg(k, "seconds", "frame", seq); if (sec === null) fail("each key needs frame or seconds (sequence time)"); return sec; }
+        var plan = { action: "setClipVolume", clip: clip.name, track: "audio " + (Number(a.trackIndex) || 0), beforeDb: beforeDb };
+        if (a.db !== undefined && a.db !== null) plan.db = Number(a.db);
+        if (keys) { plan.keys = []; for (i = 0; i < keys.length; i++) plan.keys.push({ time: timeInfo(keyTime(keys[i]), seq), db: Number(keys[i].db) }); }
+        if (a.clearKeys) plan.clearKeys = true;
+        if (!keys && !a.clearKeys && (a.db === undefined || a.db === null)) fail("give db, keys, or clearKeys");
+        if (a.dryRun) return { dryRun: true, plan: plan };
+        if (a.clearKeys || keys) { try { if (lp.prop.isTimeVarying()) { var ks = lp.prop.getKeys(); if (ks) for (var r = ks.length - 1; r >= 0; r--) lp.prop.removeKey(ks[r]); } } catch (e1) {} }
+        if (a.clearKeys && !keys) { try { lp.prop.setTimeVarying(false); } catch (e2) {} }
+        if (a.db !== undefined && a.db !== null && !keys) { try { if (lp.prop.isTimeVarying()) lp.prop.setTimeVarying(false); } catch (e3) {} lp.prop.setValue(dbToLevel(Number(a.db)), true); }
+        if (keys) {
+            lp.prop.setTimeVarying(true);
+            for (i = 0; i < keys.length; i++) { var tt = makeTime(srcTime(clip, keyTime(keys[i]))); lp.prop.addKey(tt); lp.prop.setValueAtKey(tt, dbToLevel(Number(keys[i].db)), true); }
+        }
+        var info = componentInfo(lp.comp, lp.compIndex, clip, seq, true).properties[lp.propIndex];
+        info.db = round(levelToDb(info.value));
+        if (info.keys) for (i = 0; i < info.keys.length; i++) info.keys[i].db = round(levelToDb(info.keys[i].value));
+        return { clip: clip.name, track: "audio " + (Number(a.trackIndex) || 0), level: info, beforeDb: beforeDb };
+    };
+
+    // ---------------------------------------------------------------- graphics (native Text components + AE Motion Graphics Templates)
+    function parseMaybeJSON(s) { try { if (typeof s === "string" && /^\s*\{/.test(s)) return C.parse(s); } catch (e) {} return null; }
+    function graphicTexts(clip) {
+        var out = [], c, p;
+        var m = null; try { m = clip.getMGTComponent(); } catch (e0) {}
+        if (m) {
+            for (p = 0; p < m.properties.numItems; p++) {
+                var pr = m.properties[p], v = null; try { v = pr.getValue(); } catch (e1) {}
+                var j = parseMaybeJSON(v);
+                if (j && j.textEditValue !== undefined) out.push({ kind: "mogrt", param: pr.displayName, paramIndex: p, text: j.textEditValue, font: j.fontEditValue, fontSize: j.fontSizeEditValue });
+                else if (pr.displayName) out.push({ kind: "mogrt-param", param: pr.displayName, paramIndex: p, value: (typeof v === "string" && v.length > 80) ? v.substr(0, 80) + "…" : v });
+            }
+        }
+        for (c = 0; c < clip.components.numItems; c++) {
+            var comp = clip.components[c]; if (String(comp.matchName) !== "AE.ADBE Text") continue;
+            var st = null; for (p = 0; p < comp.properties.numItems; p++) if (/Source Text/i.test(String(comp.properties[p].displayName))) st = { prop: comp.properties[p], index: p };
+            if (!st) continue;
+            var tv = null; try { tv = st.prop.getValue(); } catch (e2) {}
+            var txt = typeof tv === "string" ? tv : String(tv);
+            if (txt.length <= 2 && txt.charCodeAt(0) > 255) txt = "(binary text document; set it with pr_set_graphic_text to read it back as plain text)";
+            out.push({ kind: "text-layer", componentIndex: c, propertyIndex: st.index, text: txt });
+        }
+        return out;
+    }
+    C.getGraphicText = function (a) {
+        var seq = findSequence(a.sequence), t = findClipArg(seq, a);
+        var isMGT = false; try { isMGT = t.clip.isMGT(); } catch (e) {}
+        return { clip: clipInfo(t.clip, seq, t.type, Number(a.trackIndex) || 0, t.index), isGraphic: isMGT, texts: graphicTexts(t.clip) };
+    };
+    C.setGraphicText = function (a) {
+        var seq = findSequence(a.sequence), t = findClipArg(seq, a), clip = t.clip;
+        var texts = graphicTexts(clip), targets = [], i;
+        if (!a.text && a.text !== "") fail("text is required");
+        var sel = a.target; // param name / "text-layer:N" / index into texts / undefined → first text
+        for (i = 0; i < texts.length; i++) {
+            var x = texts[i];
+            if (x.kind === "mogrt-param") continue;
+            if (sel === undefined || sel === null || sel === "") { targets.push(x); break; }
+            if (typeof sel === "number" && i === sel) targets.push(x);
+            else if (x.kind === "mogrt" && String(x.param).toLowerCase() === String(sel).toLowerCase()) targets.push(x);
+            else if (x.kind === "text-layer" && (String(sel) === "text-layer:" + x.componentIndex || String(sel) === String(x.componentIndex))) targets.push(x);
+        }
+        if (!targets.length) fail(texts.length ? "no text target matches '" + sel + "'; targets: " + (function () { var n = []; for (var k = 0; k < texts.length; k++) if (texts[k].kind !== "mogrt-param") n.push(texts[k].kind === "mogrt" ? texts[k].param : "text-layer:" + texts[k].componentIndex); return n.join(", "); })() : "clip '" + clip.name + "' has no editable text");
+        if (a.dryRun) return { dryRun: true, plan: { action: "setGraphicText", clip: clip.name, targets: targets, text: a.text } };
+        var done = [];
+        for (i = 0; i < targets.length; i++) {
+            var tg = targets[i];
+            if (tg.kind === "mogrt") {
+                var m = clip.getMGTComponent(), pr = m.properties[tg.paramIndex], j = parseMaybeJSON(pr.getValue());
+                j.textEditValue = String(a.text);
+                if (j.fontTextRunLength && j.fontTextRunLength.length === 1) j.fontTextRunLength = [String(a.text).length];
+                if (a.font) { j.fontEditValue = [String(a.font)]; }
+                if (a.fontSize) { j.fontSizeEditValue = [Number(a.fontSize)]; }
+                pr.setValue(C.stringify(j), true);
+                var back = parseMaybeJSON(pr.getValue());
+                done.push({ target: tg.param, text: back ? back.textEditValue : null, ok: !!back && back.textEditValue === String(a.text) });
+            } else {
+                var comp = clip.components[tg.componentIndex], sp = comp.properties[tg.propertyIndex];
+                sp.setValue(String(a.text), true);
+                var v2 = String(sp.getValue());
+                done.push({ target: "text-layer:" + tg.componentIndex, text: v2, ok: v2 === String(a.text) });
+            }
+        }
+        return { clip: clip.name, set: done };
+    };
+    C.addGraphic = function (a) {
+        var seq = findSequence(a.sequence);
+        var f = new File(String(a.path || "")); if (!f.exists) fail("MOGRT not found: " + f.fsName);
+        var at = timeArg(a, "startSeconds", "startFrame", seq); if (at === null) at = 0;
+        var vIdx = a.trackIndex !== undefined && a.trackIndex !== null ? Number(a.trackIndex) : 1, aIdx = a.audioTrackIndex !== undefined && a.audioTrackIndex !== null ? Number(a.audioTrackIndex) : 0;
+        if (vIdx >= seq.videoTracks.numTracks) fail("video track " + vIdx + " doesn't exist (" + seq.videoTracks.numTracks + " tracks); add one with pr_add_tracks");
+        if (a.dryRun) return { dryRun: true, plan: { action: "addGraphic", mogrt: f.fsName, start: timeInfo(at, seq), track: "video " + vIdx } };
+        var track = seq.videoTracks[vIdx], before = track.clips.numItems;
+        var r = null; try { r = seq.importMGT(f.fsName, String(Math.round(at * TICKS)), vIdx, aIdx); } catch (e) { fail("importMGT failed: " + e.message); }
+        var waited = 0; while (track.clips.numItems === before && waited < 5000) { $.sleep(250); waited += 250; }
+        if (track.clips.numItems === before) fail("Premiere did not add the graphic (importMGT returned " + String(r) + ")");
+        var placed = clipAtStart(track, at, seq), clip = placed.clip;
+        if (a.name) { try { clip.name = String(a.name); } catch (e2) {} }
+        var out = { clip: clipInfo(clip, seq, "video", vIdx, placed.index), texts: graphicTexts(clip) };
+        if (a.duration !== undefined && a.duration !== null) {
+            var dur = Number(a.duration), ne = at + dur;
+            try { if (ne > secondsOf(clip.end)) { clip.outPoint = makeTime(secondsOf(clip.inPoint) + dur); clip.end = makeTime(ne); } else { clip.end = makeTime(ne); clip.outPoint = makeTime(secondsOf(clip.inPoint) + dur); } out.clip = clipInfo(clip, seq, "video", vIdx, placed.index); } catch (e3) { out.warning = "duration not applied: " + e3.message; }
+        }
+        return out;
+    };
+
+    // ---------------------------------------------------------------- close a gap on every track (ripple left)
+    C.closeGap = function (a) {
+        var seq = findSequence(a.sequence);
+        var from = timeArg(a, "fromSeconds", "fromFrame", seq), to = timeArg(a, "toSeconds", "toFrame", seq);
+        if (from === null || to === null || to <= from) fail("give fromSeconds/toSeconds (to > from)");
+        var shift = to - from, moved = 0, blocked = [], t, i, lists = [["video", seq.videoTracks], ["audio", seq.audioTracks]];
+        // anything still inside the gap blocks the ripple
+        for (t = 0; t < lists.length; t++) for (i = 0; i < lists[t][1].numTracks; i++) { var tr = lists[t][1][i]; for (var c = 0; c < tr.clips.numItems; c++) { var cl = tr.clips[c]; if (secondsOf(cl.end) > from + 0.002 && secondsOf(cl.start) < to - 0.002) blocked.push({ track: lists[t][0] + " " + i, clip: cl.name, start: timeInfo(cl.start, seq), end: timeInfo(cl.end, seq) }); } }
+        if (blocked.length) fail("clips still occupy the gap; remove or split them first", { blocked: blocked });
+        if (a.dryRun) return { dryRun: true, plan: { action: "closeGap", from: timeInfo(from, seq), to: timeInfo(to, seq), shift: timeInfo(shift, seq) } };
+        for (t = 0; t < lists.length; t++) for (i = 0; i < lists[t][1].numTracks; i++) {
+            var track = lists[t][1][i], later = [];
+            for (var k = 0; k < track.clips.numItems; k++) if (secondsOf(track.clips[k].start) >= to - 0.002) later.push(track.clips[k]);
+            later.sort(function (x, y) { return secondsOf(x.start) - secondsOf(y.start); });
+            for (var m = 0; m < later.length; m++) { var clip = later[m], want = secondsOf(clip.start) - shift; try { clip.move(makeTime(-shift)); } catch (e) {} if (Math.abs(secondsOf(clip.start) - want) > 0.002) { try { var dur = secondsOf(clip.end) - secondsOf(clip.start); clip.start = makeTime(want); clip.end = makeTime(want + dur); } catch (e2) {} } if (Math.abs(secondsOf(clip.start) - want) <= 0.002) moved++; else blocked.push({ track: lists[t][0] + " " + i, clip: clip.name, wanted: timeInfo(want, seq), at: timeInfo(clip.start, seq) }); }
+        }
+        var out = { from: timeInfo(from, seq), to: timeInfo(to, seq), shift: timeInfo(shift, seq), clipsMoved: moved, end: timeInfo(seq.end, seq) };
+        if (blocked.length) out.notMoved = blocked;
         return out;
     };
 

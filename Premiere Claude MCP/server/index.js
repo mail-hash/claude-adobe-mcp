@@ -31,10 +31,17 @@ sets in/out points (work-area changes are accepted but not applied by Premiere 2
 Looking at an edit: pr_review_sheet returns one labelled contact sheet of a whole sequence (evenly spaced, at clip starts or at markers) plus a
 per-frame summary; pr_show_frame shows one frame. pr_detect_shots finds cuts in a media file with ffmpeg (optionally adding Shot N markers).
 pr_build_from_edit takes an ordered shot list (durations, gaps, audio beds) and lays it out back to back, importing, building and adding a marker per shot.
+Effects: pr_get_clip_effects / pr_add_effect / pr_set_effect_property (values or keyframes in sequence time; Premiere stores keys in
+source time, the bridge converts). Transitions: pr_list_transitions / pr_add_transition / pr_remove_transitions. pr_split_clip razors,
+pr_trim_clip moves clip edges keeping content in place, pr_move_clip to_track_index moves across tracks. Clip speed is not
+settable through Premiere 26.5's API.
+Transcript: pr_transcribe (local mlx_whisper, word timings) then pr_cut_by_transcript (fillers / words / phrases / ranges, razor + remove +
+close gaps). Audio: pr_analyze_audio (LUFS, peaks, silences), pr_set_clip_volume (dB, keyframes), pr_duck_audio. Graphics:
+pr_list_mogrts / pr_add_graphic / pr_get_graphic_text / pr_set_graphic_text.
 pr_run_script runs raw ExtendScript with helpers: getProject(nameOrPath), getSequence(project, nameOrId), findItem(ref),
 findBin(path, create), qeSequence(seq), makeTime(sec), timeInfo(t, seq), log(...) (collected into "output").`;
 
-const server = new McpServer({ name: "premiere-bridge", version: "1.2.0" }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: "premiere-bridge", version: "1.4.0" }, { instructions: INSTRUCTIONS });
 const text = (s) => ({ content: [{ type: "text", text: typeof s === "string" ? s : JSON.stringify(s, null, 1) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: String(e?.message ?? e) + (e?.detail ? "\n" + JSON.stringify(e.detail, null, 1) : "") }] });
 const tool = (name, def, fn) => server.registerTool(name, def, async (args) => { try { return await fn(args); } catch (e) { return fail(e); } });
@@ -209,9 +216,9 @@ tool("pr_set_clip_enabled", {
 
 tool("pr_move_clip", {
   title: "Move / nudge clip",
-  description: "Move a clip on its track: to_frame / to_seconds (absolute) or delta_frames / delta_seconds (nudge). Fails if Premiere refuses (e.g. another clip in the way).",
-  inputSchema: { sequence: Seq, track_type: TrackType, track_index: z.number().int().optional(), clip_index: z.number().int().optional(), at_frame: z.number().optional(), at_seconds: z.number().optional(), to_frame: z.number().optional(), to_seconds: z.number().optional(), delta_frames: z.number().optional(), delta_seconds: z.number().optional(), project: Project, dry_run: DryRun },
-}, async (a) => text(await call("moveClip", { sequence: a.sequence, trackType: a.track_type, trackIndex: a.track_index ?? 0, clipIndex: a.clip_index, atFrame: a.at_frame, atSeconds: a.at_seconds, toFrame: a.to_frame, toSeconds: a.to_seconds, deltaFrames: a.delta_frames, deltaSeconds: a.delta_seconds, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+  description: "Move a clip on its track: to_frame / to_seconds (absolute) or delta_frames / delta_seconds (nudge), and/or to another track of the same type with to_track_index. Fails if Premiere refuses (e.g. another clip in the way).",
+  inputSchema: { sequence: Seq, track_type: TrackType, track_index: z.number().int().optional(), clip_index: z.number().int().optional(), at_frame: z.number().optional(), at_seconds: z.number().optional(), to_frame: z.number().optional(), to_seconds: z.number().optional(), delta_frames: z.number().optional(), delta_seconds: z.number().optional(), to_track_index: z.number().int().optional().describe("move to this track (same type)"), project: Project, dry_run: DryRun },
+}, async (a) => text(await call("moveClip", { sequence: a.sequence, trackType: a.track_type, trackIndex: a.track_index ?? 0, clipIndex: a.clip_index, atFrame: a.at_frame, atSeconds: a.at_seconds, toFrame: a.to_frame, toSeconds: a.to_seconds, deltaFrames: a.delta_frames, deltaSeconds: a.delta_seconds, toTrackIndex: a.to_track_index, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
 
 tool("pr_set_track_enabled", {
   title: "Set track enabled / locked",
@@ -276,6 +283,308 @@ tool("pr_sequence_range", {
   description: "Read (no arguments) or set a sequence's in/out points and work area. In/out points are what pr_render range: inout uses and set reliably. Premiere 26.5's scripting API accepts work-area changes but does not apply them; the result's notes say so when that happens, so prefer in/out points.",
   inputSchema: { sequence: Seq, in_frame: z.number().optional(), in_seconds: z.number().optional(), out_frame: z.number().optional(), out_seconds: z.number().optional(), work_area_in_frame: z.number().optional(), work_area_in_seconds: z.number().optional(), work_area_out_frame: z.number().optional(), work_area_out_seconds: z.number().optional(), work_area_enabled: z.boolean().optional(), project: Project, dry_run: DryRun },
 }, async (a) => text(await call("sequenceRange", { sequence: a.sequence, inFrame: a.in_frame, inSeconds: a.in_seconds, outFrame: a.out_frame, outSeconds: a.out_seconds, workAreaInFrame: a.work_area_in_frame, workAreaInSeconds: a.work_area_in_seconds, workAreaOutFrame: a.work_area_out_frame, workAreaOutSeconds: a.work_area_out_seconds, workAreaEnabled: a.work_area_enabled, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+// ------------------------------------------------------------------ effects, transitions, split, trim
+const ClipRef = { sequence: Seq, track_type: TrackType, track_index: z.number().int().optional(), clip_index: z.number().int().optional().describe("index on the track (see pr_get_sequence)"), at_frame: z.number().optional().describe("or pick the clip under this frame"), at_seconds: z.number().optional(), project: Project };
+const clipRefArgs = (a) => ({ sequence: a.sequence, trackType: a.track_type, trackIndex: a.track_index ?? 0, clipIndex: a.clip_index, atFrame: a.at_frame, atSeconds: a.at_seconds, project: a.project });
+
+tool("pr_get_clip_effects", {
+  title: "Get clip effects",
+  description: "Every component on a clip (Opacity, Motion, and added effects such as Lumetri Color or Gaussian Blur) with its properties: index, name, value, timeVarying and keyframes (sequence time + source time). Use the indexes/names with pr_set_effect_property. component narrows to one.",
+  inputSchema: { ...ClipRef, component: z.string().optional(), keys: z.boolean().optional().describe("include keyframes (default true)") },
+  annotations: { readOnlyHint: true },
+}, async (a) => text(await call("getClipEffects", { ...clipRefArgs(a), component: a.component, keys: a.keys }, { timeoutMs: 60000 })));
+
+tool("pr_list_effects", {
+  title: "List available effects",
+  description: "Video (default) or audio effects Premiere can add (Lumetri Color, Gaussian Blur, Crop, Warp Stabilizer…), optionally filtered.",
+  inputSchema: { type: z.enum(["video", "audio"]).optional(), filter: z.string().optional() },
+  annotations: { readOnlyHint: true },
+}, async (a) => text(await call("listEffects", { type: a.type, filter: a.filter }, { timeoutMs: 60000 })));
+
+tool("pr_add_effect", {
+  title: "Add effect to clip",
+  description: "Add a video or audio effect to a clip by name (exact, or a unique fragment; see pr_list_effects). Returns the new component with its properties so you can set them with pr_set_effect_property.",
+  inputSchema: { ...ClipRef, effect: z.string(), dry_run: DryRun },
+}, async (a) => text(await call("addEffect", { ...clipRefArgs(a), effect: a.effect, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+tool("pr_set_effect_property", {
+  title: "Set effect property / keyframes",
+  description: `Set a property of a clip component: value (number, [x, y] for Position/Anchor, true/false, or [r, g, b, a] for colors), or keys: [{ frame | seconds, value }] in SEQUENCE time (converted to Premiere's source-time keyframes; existing keys are replaced), or clear_keys: true. Motion Position/Anchor are 0-1 fractions of the frame; Scale and Opacity are percentages; Rotation is degrees. Note: Opacity changes read back but did not show in exported frames in Premiere 26.5 tests.`,
+  inputSchema: { ...ClipRef, component: z.union([z.string(), z.number().int()]).describe("component name (Motion, Opacity, Lumetri Color…), matchName or index"), property: z.union([z.string(), z.number().int()]).describe("property name or index"), value: z.any().optional(), keys: z.array(z.object({ frame: z.number().optional(), seconds: z.number().optional(), value: z.any() })).optional(), clear_keys: z.boolean().optional(), dry_run: DryRun },
+}, async (a) => text(await call("setEffectProperty", { ...clipRefArgs(a), component: a.component, property: a.property, value: a.value, keys: a.keys, clearKeys: a.clear_keys, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+tool("pr_list_transitions", {
+  title: "List transitions",
+  description: "catalog: true lists the transitions Premiere can add (Cross Dissolve, Dip to Black, Push, …; include_legacy false hides Legacy/Obsolete ones). Otherwise lists the transitions on a track of a sequence with index, name, start/end/duration.",
+  inputSchema: { catalog: z.boolean().optional(), type: z.enum(["video", "audio"]).optional(), filter: z.string().optional(), include_legacy: z.boolean().optional(), sequence: Seq, track_type: TrackType, track_index: z.number().int().optional(), project: Project },
+  annotations: { readOnlyHint: true },
+}, async (a) => text(await call("listTransitions", { catalog: a.catalog, type: a.type, filter: a.filter, includeLegacy: a.include_legacy, sequence: a.sequence, trackType: a.track_type, trackIndex: a.track_index ?? 0, project: a.project }, { timeoutMs: 60000 })));
+
+tool("pr_add_transition", {
+  title: "Add transition",
+  description: "Add a transition (default Cross Dissolve; any name from pr_list_transitions catalog) at the end (default), start or both ends of a clip, with a duration (default 1 s). Returns the track's transitions afterwards. The clip needs media handles for the transition to fit.",
+  inputSchema: { ...ClipRef, transition: z.string().optional(), position: z.enum(["start", "end", "both"]).optional(), duration_seconds: z.number().optional(), duration_frames: z.number().optional(), dry_run: DryRun },
+}, async (a) => text(await call("addTransition", { ...clipRefArgs(a), transition: a.transition, position: a.position, durationSeconds: a.duration_seconds, durationFrames: a.duration_frames, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+tool("pr_remove_transitions", {
+  title: "Remove transitions",
+  description: "Remove transitions on a track: by indexes (from pr_list_transitions), the one under at_frame/at_seconds, a name filter, or all: true.",
+  inputSchema: { sequence: Seq, track_type: TrackType, track_index: z.number().int().optional(), indexes: z.array(z.number().int()).optional(), at_frame: z.number().optional(), at_seconds: z.number().optional(), filter: z.string().optional(), all: z.boolean().optional(), project: Project, dry_run: DryRun },
+}, async (a) => text(await call("removeTransitions", { sequence: a.sequence, trackType: a.track_type, trackIndex: a.track_index ?? 0, indexes: a.indexes, atFrame: a.at_frame, atSeconds: a.at_seconds, filter: a.filter, all: a.all, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+tool("pr_split_clip", {
+  title: "Split (razor) at a time",
+  description: "Razor the clip under a frame/second on one track, or every track (all_tracks: true), like pressing C and clicking. Reports per track whether a split happened.",
+  inputSchema: { sequence: Seq, track_type: TrackType, track_index: z.number().int().optional(), at_frame: z.number().optional(), at_seconds: z.number().optional(), all_tracks: z.boolean().optional(), project: Project, dry_run: DryRun },
+}, async (a) => text(await call("splitClip", { sequence: a.sequence, trackType: a.track_type, trackIndex: a.track_index ?? 0, atFrame: a.at_frame, atSeconds: a.at_seconds, allTracks: a.all_tracks, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+tool("pr_trim_clip", {
+  title: "Trim clip edges",
+  description: "Move a clip's start and/or end on the timeline (absolute frame/seconds or delta), keeping the source in/out in step so the content doesn't shift: shortening cuts off material, extending reveals more handle. Warns when Premiere clamps (no handle, or a neighbour in the way). Speed changes aren't available in Premiere 26.5's scripting API.",
+  inputSchema: { ...ClipRef, start_frame: z.number().optional(), start_seconds: z.number().optional(), start_delta_frames: z.number().optional(), start_delta_seconds: z.number().optional(), end_frame: z.number().optional(), end_seconds: z.number().optional(), end_delta_frames: z.number().optional(), end_delta_seconds: z.number().optional(), dry_run: DryRun },
+}, async (a) => text(await call("trimClip", { ...clipRefArgs(a), startFrame: a.start_frame, startSeconds: a.start_seconds, startDeltaFrames: a.start_delta_frames, startDeltaSeconds: a.start_delta_seconds, endFrame: a.end_frame, endSeconds: a.end_seconds, endDeltaFrames: a.end_delta_frames, endDeltaSeconds: a.end_delta_seconds, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+// ------------------------------------------------------------------ transcript, audio, graphics
+const SUPPORT_DIR = path.join(os.homedir(), "Library", "Application Support", "Premiere Claude Bridge");
+const FILLERS = ["um", "uh", "umm", "uhh", "hmm", "mm", "ah", "er", "erm", "like", "you know", "i mean", "sort of", "kind of", "basically", "actually", "literally", "right", "okay so", "so yeah"];
+const DEFAULT_FILLERS = ["um", "uh", "umm", "uhh", "hmm", "er", "erm", "ah"];
+
+async function whisperPath() {
+  const cands = [process.env.MLX_WHISPER, path.join(os.homedir(), ".local", "bin", "mlx_whisper"), "/opt/homebrew/bin/mlx_whisper", "mlx_whisper"].filter(Boolean);
+  for (const c of cands) { try { await run(c, ["--help"], { timeout: 20000 }); return c; } catch {} }
+  return null;
+}
+async function resolveMediaRef(ref, project) {
+  if (ref && path.isAbsolute(ref) && (await fs.stat(ref).catch(() => null))) return { mediaPath: ref, item: null };
+  const items = await call("listItems", { project, durations: false, limit: 5000 }, { timeoutMs: 120000 });
+  const hit = items.items.find((i) => i.id === ref) || items.items.filter((i) => normName(i.name) === normName(ref));
+  const it = Array.isArray(hit) ? (hit.length === 1 ? hit[0] : null) : hit;
+  if (!it) throw new Error(Array.isArray(hit) && hit.length > 1 ? `'${ref}' matches ${hit.length} project items; use an id` : `'${ref}' is not a file path or a project item`);
+  if (!it.mediaPath) throw new Error(`project item '${it.name}' has no media file (a sequence? pass sequence: instead)`);
+  return { mediaPath: it.mediaPath, item: it };
+}
+// Audio of a whole sequence: render a WAV through Premiere (direct mode) so edits, levels and ducking are included.
+async function sequenceWav(sequence, project, { inSeconds, outSeconds } = {}) {
+  const [preset] = await findPresets("Waveform Audio");
+  if (!preset) throw new Error("No 'Waveform Audio' export preset found (Adobe Media Encoder presets missing?)");
+  const dir = path.join(SUPPORT_DIR, "audio"); await fs.mkdir(dir, { recursive: true });
+  const out = path.join(dir, `seq-${Date.now()}.wav`);
+  const r = await call("render", { sequence, presetPath: preset, path: out, mode: "direct", inSeconds, outSeconds, range: inSeconds !== undefined ? undefined : "entire", project }, { timeoutMs: 3600000 });
+  const file = r.path || out;
+  if (!(await fs.stat(file).catch(() => null))) throw new Error("Premiere did not write the sequence audio: " + JSON.stringify(r).slice(0, 300));
+  return { wav: file, render: r };
+}
+async function to16kWav(src) {
+  const ff = await ffmpegPath(); if (!ff) throw new Error("ffmpeg not found (brew install ffmpeg)");
+  const dir = path.join(SUPPORT_DIR, "audio"); await fs.mkdir(dir, { recursive: true });
+  const out = path.join(dir, path.basename(src).replace(/\.[^.]+$/, "") + "-16k.wav");
+  await run(ff, ["-y", "-loglevel", "error", "-i", src, "-vn", "-ac", "1", "-ar", "16000", out], { timeout: 600000 });
+  return out;
+}
+const fpsFrames = (sec, fps) => Math.round(sec * fps);
+const tInfo = (sec, fps) => ({ seconds: +sec.toFixed(3), frames: fpsFrames(sec, fps), timecode: tcOf(sec, fps) });
+
+tool("pr_transcribe", {
+  title: "Transcribe (word timings)",
+  description: `Speech-to-text with word timestamps, run locally with mlx_whisper (Apple silicon). Source: a sequence (its audio is rendered through Premiere, so times are sequence times and edits/levels are included), or a project item / media file (times are media times; with sequence given too, each word is also mapped to where that media sits in the sequence). Returns the text, segments, words (start/end seconds + frames + timecode), and the path of the saved transcript JSON for pr_cut_by_transcript. model: whisper-tiny/base/small/medium/large-v3 (mlx-community), default base; the first run downloads it.`,
+  inputSchema: { sequence: Seq, item: z.string().optional().describe("project item id/name or media path (instead of rendering the sequence)"), language: z.string().optional().describe("ISO code, default auto"), model: z.string().optional(), in_seconds: z.number().optional(), out_seconds: z.number().optional(), max_words: z.number().int().optional().describe("words to include inline (default 400; the JSON file has all)"), project: Project },
+}, async (a) => {
+  const wp = await whisperPath(); if (!wp) throw new Error("mlx_whisper not found. Install it with: uv tool install mlx-whisper   (or pip install mlx-whisper), then retry.");
+  let src, mode, item = null, seqInfo = null, fps = 30;
+  if (a.sequence || !a.item) { seqInfo = await call("getSequence", { sequence: a.sequence, clips: !!a.item, project: a.project }, { timeoutMs: 120000 }); fps = seqInfo.fps || 30; }
+  if (a.item) { const m = await resolveMediaRef(a.item, a.project); src = m.mediaPath; item = m.item; mode = "media"; if (!seqInfo) { try { const pr = await run(await ffprobePath(), ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", src]); const [n, d] = pr.stdout.trim().split("/").map(Number); if (n && d) fps = n / d; } catch {} } }
+  else { const r = await sequenceWav(a.sequence, a.project, { inSeconds: a.in_seconds, outSeconds: a.out_seconds }); src = r.wav; mode = "sequence"; }
+  const wav = await to16kWav(src);
+  const outDir = path.join(SUPPORT_DIR, "transcripts"); await fs.mkdir(outDir, { recursive: true });
+  const model = a.model ? (a.model.includes("/") ? a.model : `mlx-community/${a.model.startsWith("whisper-") ? a.model : "whisper-" + a.model}${/-mlx$/.test(a.model) ? "" : "-mlx"}`) : "mlx-community/whisper-base-mlx";
+  const args = [wav, "--model", model, "--word-timestamps", "True", "--output-format", "json", "--output-dir", outDir, "--verbose", "False"];
+  if (a.language) args.push("--language", a.language);
+  const t0 = Date.now();
+  try { await run(wp, args, { timeout: 3600000, env: { ...process.env, PATH: `${path.join(os.homedir(), ".local", "bin")}:/opt/homebrew/bin:${process.env.PATH || ""}` }, maxBuffer: 64 * 1024 * 1024 }); }
+  catch (e) { throw new Error("mlx_whisper failed: " + String(e.stderr || e.message).slice(-800)); }
+  const raw = JSON.parse(await fs.readFile(path.join(outDir, path.basename(wav, ".wav") + ".json"), "utf8"));
+  const offset = mode === "sequence" ? (a.in_seconds || 0) : 0;
+  // map media time → sequence time via the clips that use this media
+  let placements = [];
+  if (mode === "media" && seqInfo?.tracks) for (const t of seqInfo.tracks) for (const c of t.clips || []) if ((item && c.itemId === item.id) || c.mediaPath === src) placements.push({ track: t.type + " " + t.index, clipIndex: c.index, start: c.start.seconds, end: c.end.seconds, inPoint: c.inPoint.seconds, outPoint: c.outPoint.seconds });
+  const mapToSeq = (sec) => { for (const p of placements) if (sec >= p.inPoint - 1e-3 && sec <= p.outPoint + 1e-3) return { seconds: +(p.start + (sec - p.inPoint)).toFixed(3), track: p.track, clipIndex: p.clipIndex }; return null; };
+  const words = [];
+  for (const s of raw.segments || []) for (const w of s.words || []) {
+    const rec = { word: String(w.word).trim(), start: tInfo(w.start + offset, fps), end: tInfo(w.end + offset, fps), probability: +Number(w.probability || 0).toFixed(2) };
+    if (mode === "media") { const m = mapToSeq(w.start); if (m) rec.sequence = { start: tInfo(m.seconds, fps), end: tInfo(m.seconds + (w.end - w.start), fps), track: m.track, clipIndex: m.clipIndex }; }
+    words.push(rec);
+  }
+  const segments = (raw.segments || []).map((s) => ({ start: tInfo(s.start + offset, fps), end: tInfo(s.end + offset, fps), text: String(s.text).trim() }));
+  const transcript = { source: src, mode, sequence: seqInfo ? { id: seqInfo.id, name: seqInfo.name } : null, item: item ? { id: item.id, name: item.name } : null, fps, language: raw.language, model, placements, text: String(raw.text || "").trim(), segments, words, created: new Date().toISOString() };
+  const jsonPath = path.join(outDir, `${(seqInfo?.name || item?.name || path.basename(src)).replace(/[^\w.-]+/g, "_")}-${Date.now()}.json`);
+  await fs.writeFile(jsonPath, JSON.stringify(transcript, null, 1));
+  const maxWords = a.max_words ?? 400;
+  return text({ transcript: jsonPath, mode, fps, language: raw.language, model, seconds: +((Date.now() - t0) / 1000).toFixed(1), placements: placements.length ? placements : undefined, text: transcript.text, segments, words: words.slice(0, maxWords), wordCount: words.length, truncated: words.length > maxWords ? `showing ${maxWords} of ${words.length} words; the JSON has all` : undefined });
+});
+
+function mergeRanges(ranges, pad = 0, minGap = 0.04) {
+  const rs = ranges.map((r) => ({ from: Math.max(0, r.from - pad), to: r.to + pad, labels: r.labels || [] })).sort((x, y) => x.from - y.from), out = [];
+  for (const r of rs) { const last = out[out.length - 1]; if (last && r.from <= last.to + minGap) { last.to = Math.max(last.to, r.to); last.labels.push(...r.labels); } else out.push({ ...r, labels: [...r.labels] }); }
+  return out;
+}
+
+tool("pr_cut_by_transcript", {
+  title: "Cut by transcript",
+  description: `Remove parts of a sequence based on a transcript from pr_transcribe (sequence mode): fillers: true removes um/uh/erm… (or give words: [...] to match, case-insensitive; phrases allowed), phrases: ["exact text to find"] removes every occurrence, ranges: [{from_seconds, to_seconds}] removes those spans, and word_ranges: [{from_word, to_word}] uses word indexes from the transcript. Ranges are padded (padding_ms, default 40), merged, then each span is razored on every track and removed with ripple (later material shifts left), last span first. dry_run lists the spans with their words. Markers can be added instead of cutting (mark_only: true).`,
+  inputSchema: { sequence: Seq, transcript: z.string().describe("path returned by pr_transcribe"), fillers: z.boolean().optional(), words: z.array(z.string()).optional(), phrases: z.array(z.string()).optional(), ranges: z.array(z.object({ from_seconds: z.number(), to_seconds: z.number() })).optional(), word_ranges: z.array(z.object({ from_word: z.number().int(), to_word: z.number().int() })).optional(), padding_ms: z.number().optional(), min_confidence: z.number().optional().describe("skip filler matches below this probability (default 0)"), mark_only: z.boolean().optional(), project: Project, dry_run: DryRun },
+}, async (a) => {
+  const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
+  if (tr.mode !== "sequence") throw new Error("This transcript is in media time (item mode). Run pr_transcribe with sequence: to cut by it.");
+  const seqInfo = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 });
+  const fps = seqInfo.fps || tr.fps || 30, words = tr.words || [], norm = (s) => String(s).toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, "").trim();
+  const spans = [];
+  const matchList = [...(a.fillers ? DEFAULT_FILLERS : []), ...(a.words || [])].map(norm).filter(Boolean);
+  if (matchList.length) {
+    for (let i = 0; i < words.length; i++) {
+      for (const m of matchList) {
+        const n = m.split(/\s+/).length; if (i + n > words.length) continue;
+        const phrase = words.slice(i, i + n).map((w) => norm(w.word)).join(" ");
+        if (phrase === m) { const ws = words.slice(i, i + n); if (a.min_confidence && ws.some((w) => w.probability < a.min_confidence)) continue; spans.push({ from: ws[0].start.seconds, to: ws[n - 1].end.seconds, labels: [ws.map((w) => w.word).join(" ")] }); }
+      }
+    }
+  }
+  for (const p of a.phrases || []) {
+    const target = norm(p).split(/\s+/), n = target.length;
+    for (let i = 0; i + n <= words.length; i++) if (words.slice(i, i + n).map((w) => norm(w.word)).join(" ") === target.join(" ")) spans.push({ from: words[i].start.seconds, to: words[i + n - 1].end.seconds, labels: [p] });
+  }
+  for (const r of a.ranges || []) spans.push({ from: r.from_seconds, to: r.to_seconds, labels: [`${r.from_seconds}-${r.to_seconds}s`] });
+  for (const r of a.word_ranges || []) { const w0 = words[r.from_word], w1 = words[r.to_word]; if (!w0 || !w1) throw new Error(`word index out of range (${words.length} words)`); spans.push({ from: w0.start.seconds, to: w1.end.seconds, labels: [words.slice(r.from_word, r.to_word + 1).map((w) => w.word).join(" ")] }); }
+  if (!spans.length) return text({ spans: [], note: "nothing matched" });
+  // snap every span to frame boundaries: the razor cuts on frames, and the removal must use exactly those edges
+  const merged = mergeRanges(spans, (a.padding_ms ?? 40) / 1000).map((s) => { const f0 = Math.round(s.from * fps), f1 = Math.max(Math.round(s.to * fps), Math.round(s.from * fps) + 1); return { from: tInfo(f0 / fps, fps), to: tInfo(f1 / fps, fps), duration: tInfo((f1 - f0) / fps, fps), words: s.labels }; });
+  const removedTotal = merged.reduce((t, s) => t + (s.to.seconds - s.from.seconds), 0);
+  if (a.dry_run) return text({ dryRun: true, sequence: seqInfo.name, spans: merged, count: merged.length, removedSeconds: +removedTotal.toFixed(3) });
+  if (a.mark_only) {
+    const added = [];
+    for (const s of merged) { const r = await call("addMarker", { sequence: seqInfo.id, startSeconds: s.from.seconds, endSeconds: s.to.seconds, name: "cut: " + s.words.join(" "), color: "red", project: a.project }, { timeoutMs: 60000 }); added.push(r.marker.start.timecode); }
+    return text({ sequence: seqInfo.name, marked: added.length, spans: merged });
+  }
+  const results = [];
+  for (const s of [...merged].reverse()) {
+    await call("splitClip", { sequence: seqInfo.id, atFrame: s.from.frames, allTracks: true, project: a.project }, { timeoutMs: 60000 });
+    await call("splitClip", { sequence: seqInfo.id, atFrame: s.to.frames, allTracks: true, project: a.project }, { timeoutMs: 60000 });
+    const tracks = (await call("getSequence", { sequence: seqInfo.id, clips: false, project: a.project }, { timeoutMs: 60000 })).tracks;
+    let removed = 0;
+    // half-frame margins: only pieces strictly inside the span (the razor made their edges land on these frames)
+    for (const t of tracks) { const r = await call("removeClips", { sequence: seqInfo.id, trackType: t.type, trackIndex: t.index, fromSeconds: (s.from.frames + 0.5) / fps, toSeconds: (s.to.frames - 0.5) / fps, overlapping: true, ripple: false, project: a.project }, { timeoutMs: 60000 }); removed += r.removed.length; }
+    results.push({ span: s, clipsRemoved: removed });
+  }
+  // close the gaps: ripple-delete empty space by shifting everything after each span left (last span first keeps earlier times valid)
+  const closed = [];
+  for (const s of [...merged].reverse()) {
+    const r = await call("closeGap", { sequence: seqInfo.id, fromFrame: s.from.frames, toFrame: s.to.frames, project: a.project }, { timeoutMs: 120000 });
+    closed.push(r);
+  }
+  const final = await call("getSequence", { sequence: seqInfo.id, clips: false, project: a.project }, { timeoutMs: 60000 });
+  return text({ sequence: final.name, spans: results.reverse(), removedSeconds: +removedTotal.toFixed(3), gapsClosed: closed.reverse(), end: final.end, note: "Transcript times are now stale for the removed spans; re-run pr_transcribe before cutting again." });
+});
+
+tool("pr_analyze_audio", {
+  title: "Analyze audio",
+  description: "Loudness and silence of a media file / project item, or of a whole sequence (rendered through Premiere): integrated LUFS, loudness range, true peak, mean/max volume (dBFS), and silences longer than min_silence_seconds below silence_db (default -35 dBFS, 0.5 s). Times carry frames and timecode.",
+  inputSchema: { sequence: Seq, item: z.string().optional(), silence_db: z.number().optional(), min_silence_seconds: z.number().optional(), project: Project },
+}, async (a) => {
+  const ff = await ffmpegPath(); if (!ff) throw new Error("ffmpeg not found");
+  let src, fps = 30, seqInfo = null;
+  if (a.item) { src = (await resolveMediaRef(a.item, a.project)).mediaPath; try { const pr = await run(await ffprobePath(), ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", src]); const [n, d] = pr.stdout.trim().split("/").map(Number); if (n && d) fps = n / d; } catch {} }
+  else { seqInfo = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 }); fps = seqInfo.fps || 30; src = (await sequenceWav(a.sequence, a.project)).wav; }
+  const sdb = a.silence_db ?? -35, sdur = a.min_silence_seconds ?? 0.5;
+  const r = await run(ff, ["-hide_banner", "-nostats", "-i", src, "-vn", "-af", `ebur128=peak=true,volumedetect,silencedetect=n=${sdb}dB:d=${sdur}`, "-f", "null", "-"], { timeout: 1800000, maxBuffer: 64 * 1024 * 1024 }).catch((e) => e);
+  const log = String(r.stderr || "");
+  const num = (re) => { const m = re.exec(log); return m ? Number(m[1]) : null; };
+  const silences = []; const starts = [...log.matchAll(/silence_start: ([\d.]+)/g)].map((m) => Number(m[1])), ends = [...log.matchAll(/silence_end: ([\d.]+) \| silence_duration: ([\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])]);
+  starts.forEach((s, i) => { const e = ends[i]; silences.push({ start: tInfo(s, fps), end: e ? tInfo(e[0], fps) : null, duration: e ? tInfo(e[1], fps) : null }); });
+  return text({ source: src, sequence: seqInfo ? seqInfo.name : undefined, fps, loudness: { integratedLufs: num(/I:\s+(-?[\d.]+) LUFS/), rangeLu: num(/LRA:\s+([\d.]+) LU/), truePeakDbtp: num(/Peak:\s+(-?[\d.]+) dBFS/), meanVolumeDb: num(/mean_volume: (-?[\d.]+) dB/), maxVolumeDb: num(/max_volume: (-?[\d.]+) dB/) }, silence: { thresholdDb: sdb, minSeconds: sdur, count: silences.length, silences }, hints: { toMinus14Lufs: num(/I:\s+(-?[\d.]+) LUFS/) !== null ? +(-14 - num(/I:\s+(-?[\d.]+) LUFS/)).toFixed(1) + " dB" : undefined } });
+});
+
+const AudioClipRef = { sequence: Seq, track_index: z.number().int().optional().describe("audio track index (default 0)"), clip_index: z.number().int().optional(), at_frame: z.number().optional(), at_seconds: z.number().optional(), project: Project };
+tool("pr_set_clip_volume", {
+  title: "Set clip volume (dB)",
+  description: "Set an audio clip's Volume > Level in dB (0 = unity, -inf..+15), or keyframes keys: [{ frame | seconds, db }] in sequence time (fades, ducks), or clear_keys. Returns the level with keys in dB.",
+  inputSchema: { ...AudioClipRef, db: z.number().optional(), keys: z.array(z.object({ frame: z.number().optional(), seconds: z.number().optional(), db: z.number() })).optional(), clear_keys: z.boolean().optional(), dry_run: DryRun },
+}, async (a) => text(await call("setClipVolume", { sequence: a.sequence, trackIndex: a.track_index ?? 0, clipIndex: a.clip_index, atFrame: a.at_frame, atSeconds: a.at_seconds, db: a.db, keys: a.keys, clearKeys: a.clear_keys, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+tool("pr_duck_audio", {
+  title: "Duck music under dialogue",
+  description: "Lower the clips on an audio track (music) while another track (dialogue) has clips, or during given ranges: keyframes base_db → duck_db with fade_seconds ramps on every music clip that overlaps. dry_run lists the keyframes per clip.",
+  inputSchema: { sequence: Seq, music_track_index: z.number().int(), under_track_index: z.number().int().optional().describe("audio track whose clips define the duck ranges"), ranges: z.array(z.object({ from_seconds: z.number(), to_seconds: z.number() })).optional(), duck_db: z.number().optional().describe("default -12"), base_db: z.number().optional().describe("default 0"), fade_seconds: z.number().optional().describe("default 0.3"), project: Project, dry_run: DryRun },
+}, async (a) => {
+  const seq = await call("getSequence", { sequence: a.sequence, project: a.project }, { timeoutMs: 120000 });
+  const fps = seq.fps || 30, duck = a.duck_db ?? -12, base = a.base_db ?? 0, fade = a.fade_seconds ?? 0.3;
+  let ranges = (a.ranges || []).map((r) => ({ from: r.from_seconds, to: r.to_seconds }));
+  if (a.under_track_index !== undefined) { const t = seq.tracks.find((x) => x.type === "audio" && x.index === a.under_track_index); if (!t) throw new Error(`audio track ${a.under_track_index} not found`); ranges.push(...(t.clips || []).filter((c) => c.enabled !== false).map((c) => ({ from: c.start.seconds, to: c.end.seconds }))); }
+  if (!ranges.length) throw new Error("give under_track_index or ranges");
+  ranges = mergeRanges(ranges, 0, fade);
+  const music = seq.tracks.find((x) => x.type === "audio" && x.index === a.music_track_index); if (!music) throw new Error(`audio track ${a.music_track_index} not found`);
+  const plan = [];
+  for (const c of music.clips || []) {
+    const keys = [];
+    for (const r of ranges) {
+      if (r.to <= c.start.seconds || r.from >= c.end.seconds) continue;
+      const f0 = Math.max(c.start.seconds, r.from - fade), f1 = Math.max(c.start.seconds, r.from), f2 = Math.min(c.end.seconds, r.to), f3 = Math.min(c.end.seconds, r.to + fade);
+      if (f0 < f1) keys.push({ seconds: +f0.toFixed(4), db: base }); keys.push({ seconds: +f1.toFixed(4), db: duck }, { seconds: +f2.toFixed(4), db: duck }); if (f3 > f2) keys.push({ seconds: +f3.toFixed(4), db: base });
+    }
+    if (!keys.length) continue;
+    if (keys[0].seconds > c.start.seconds + 1e-3) keys.unshift({ seconds: c.start.seconds, db: base });
+    if (keys[keys.length - 1].seconds < c.end.seconds - 1e-3) keys.push({ seconds: +(c.end.seconds - 1 / fps).toFixed(4), db: base });
+    plan.push({ clipIndex: c.index, clip: c.name, keys: keys.map((k) => ({ ...k, timecode: tcOf(k.seconds, fps) })) });
+  }
+  if (a.dry_run) return text({ dryRun: true, musicTrack: `audio ${a.music_track_index}`, ranges: ranges.map((r) => ({ from: tInfo(r.from, fps), to: tInfo(r.to, fps) })), clips: plan });
+  const done = [];
+  for (const p of plan) { const r = await call("setClipVolume", { sequence: seq.id, trackIndex: a.music_track_index, clipIndex: p.clipIndex, keys: p.keys.map((k) => ({ seconds: k.seconds, db: k.db })), project: a.project }, { timeoutMs: 60000 }); done.push({ clip: p.clip, keys: r.level.keys.map((k) => [k.time.timecode, k.db]) }); }
+  return text({ musicTrack: `audio ${a.music_track_index}`, ranges: ranges.length, clips: done });
+});
+
+// ---- graphics (MOGRT / Essential Graphics)
+async function mogrtFolders() {
+  let app = "Adobe Premiere Pro 2026"; try { const st = await call("status", {}, { timeoutMs: 20000 }); if (st?.version) app = `Adobe Premiere Pro ${(/^(\d{2})/.exec(st.version) || [])[1] ? "20" + st.version.slice(0, 2) : "2026"}`; } catch {}
+  return [
+    { kind: "user", dir: path.join(os.homedir(), "Library", "Application Support", "Adobe", "Common", "Motion Graphics Templates") },
+    { kind: "app", dir: path.join("/Applications", app, `${app}.app`, "Contents", "Essential Graphics") },
+  ];
+}
+async function walkExt(dir, ext, depth = 0) { const out = []; let entries = []; try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return out; } for (const e of entries) { const p = path.join(dir, e.name); if (e.isDirectory()) { if (depth < 6) out.push(...(await walkExt(p, ext, depth + 1))); } else if (e.name.toLowerCase().endsWith(ext)) out.push(p); } return out; }
+async function listMogrts(filter) {
+  const folders = await mogrtFolders(), all = [];
+  for (const f of folders) for (const p of await walkExt(f.dir, ".mogrt")) all.push({ kind: f.kind, name: path.basename(p, ".mogrt"), category: path.relative(f.dir, path.dirname(p)), path: p });
+  const words = String(filter || "").toLowerCase().split(/\s+/).filter(Boolean);
+  return { folders, mogrts: words.length ? all.filter((p) => words.every((w) => (p.category + "/" + p.name).toLowerCase().includes(w))) : all };
+}
+tool("pr_list_mogrts", {
+  title: "List Motion Graphics Templates",
+  description: "Motion Graphics Templates (.mogrt) available: the user's library (~/Library/Application Support/Adobe/Common/Motion Graphics Templates) and Premiere's built-in Essential Graphics (Basic Title, Basic Lower Third, …). filter matches words against folder + name.",
+  inputSchema: { filter: z.string().optional(), limit: z.number().int().optional() },
+  annotations: { readOnlyHint: true },
+}, async ({ filter, limit }) => { const r = await listMogrts(filter); const n = limit ?? 60; return text(`${r.mogrts.length} template(s)${r.mogrts.length > n ? `, showing ${n}` : ""}\nkind\tcategory\tname\tpath\n${r.mogrts.slice(0, n).map((m) => `${m.kind}\t${m.category}\t${m.name}\t${m.path}`).join("\n")}`); });
+
+tool("pr_add_graphic", {
+  title: "Add a Motion Graphics Template",
+  description: "Put a .mogrt (path, or a unique name from pr_list_mogrts) on a video track at a time, optionally with a duration and clip name; returns the clip and its editable texts (then pr_set_graphic_text). Built-in: 'Basic Title', 'Basic Lower Third'.",
+  inputSchema: { sequence: Seq, mogrt: z.string(), start_frame: z.number().optional(), start_seconds: z.number().optional(), track_index: z.number().int().optional().describe("video track (default 1, above the footage)"), audio_track_index: z.number().int().optional(), duration_seconds: z.number().optional(), name: z.string().optional(), project: Project, dry_run: DryRun },
+}, async (a) => {
+  let p = a.mogrt;
+  if (!path.isAbsolute(p) || !(await fs.stat(p).catch(() => null))) { const r = await listMogrts(a.mogrt); const exact = r.mogrts.filter((m) => m.name.toLowerCase() === a.mogrt.toLowerCase()); const pick = exact.length === 1 ? exact : exact.length > 1 && exact.some((m) => m.kind === "user") ? exact.filter((m) => m.kind === "user").slice(0, 1) : exact.length > 1 ? exact.slice(0, 1) : r.mogrts; if (pick.length !== 1) throw new Error(pick.length ? `'${a.mogrt}' matches ${pick.length} templates: ${pick.slice(0, 8).map((m) => m.name).join(", ")}. Give the path.` : `No template matches '${a.mogrt}' (see pr_list_mogrts)`); p = pick[0].path; }
+  return text(await call("addGraphic", { sequence: a.sequence, path: p, startFrame: a.start_frame, startSeconds: a.start_seconds, trackIndex: a.track_index, audioTrackIndex: a.audio_track_index, duration: a.duration_seconds, name: a.name, project: a.project, dryRun: a.dry_run }, { timeoutMs: 120000 }));
+});
+
+tool("pr_get_graphic_text", {
+  title: "Get graphic texts",
+  description: "Editable texts of a graphic clip: Motion Graphics Template parameters (name, text, font, size) and native text layers (Source Text). Targets for pr_set_graphic_text.",
+  inputSchema: { ...ClipRef },
+  annotations: { readOnlyHint: true },
+}, async (a) => text(await call("getGraphicText", clipRefArgs(a), { timeoutMs: 60000 })));
+
+tool("pr_set_graphic_text", {
+  title: "Set graphic text",
+  description: "Change the text of a graphic clip: target is a MOGRT parameter name (e.g. 'Title'), 'text-layer:N' for a native text layer, or omitted for the first text. font (PostScript name) and font_size apply to MOGRT parameters that allow it.",
+  inputSchema: { ...ClipRef, text: z.string(), target: z.union([z.string(), z.number().int()]).optional(), font: z.string().optional(), font_size: z.number().optional(), dry_run: DryRun },
+}, async (a) => text(await call("setGraphicText", { ...clipRefArgs(a), text: a.text, target: a.target, font: a.font, fontSize: a.font_size, dryRun: a.dry_run }, { timeoutMs: 60000 })));
 
 // ------------------------------------------------------------------ build / compare
 function normName(s) { return String(s || "").replace(/\.[^.]+$/, "").toLowerCase(); }
