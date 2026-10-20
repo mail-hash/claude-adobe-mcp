@@ -112,6 +112,24 @@ try {
     await tool("ae_run_script", { code: `findComp("Selftest Styled").remove(); "ok"` });
     return { runs: td.runs.map((x) => [x.start, x.end, x.fontSize]), shadow: [r.distance, r.color] };
   });
+  await step("ae_template_controls + ae_export_template (.mogrt with controls)", async () => {
+    const built = await tool("ae_run_script", { code: `var c = ensureComp("Selftest Template", 1920, 1080, 3, 30); var bg = c.layers.addSolid([0.1, 0.2, 0.8], "Bar", 900, 120, 1); bg.property("ADBE Transform Group").property("ADBE Position").setValue([600, 900]); var L = c.layers.addText("Name Here"); L.name = "Title"; L.property("ADBE Transform Group").property("ADBE Position").setValue([200, 920]); c.id` });
+    assert(built.ok, "template comp built");
+    const id = built.result;
+    const named = await tool("ae_template_controls", { comp_id: id, template_name: "Selftest Template " + Date.now() });
+    assert(named.name.ok && /Selftest Template/.test(named.name.templateName), "template named");
+    const a1 = await tool("ae_template_controls", { comp_id: id, add: { layer: "Title", path: "ADBE Text Properties/ADBE Text Document", name: "Title" } });
+    assert(a1.add.ok && a1.add.added, "text control added: " + JSON.stringify(a1.add));
+    const a2 = await tool("ae_template_controls", { comp_id: id, add: { layer: "Bar", path: "ADBE Transform Group/ADBE Opacity", name: "Bar Opacity" } });
+    assert(a2.add.ok && a2.controls.controls.length === 2, "two controls: " + JSON.stringify(a2.controls));
+    const d = await tool("ae_export_template", { comp_id: id, folder: path.join(dir, "mogrt"), dry_run: true });
+    assert(d.dryRun && /\.mogrt$/.test(d.plan.file), "plan");
+    const r = await tool("ae_export_template", { comp_id: id, folder: path.join(dir, "mogrt"), overwrite: true });
+    assert(r.ok && r.bytes > 5000 && (await fs.stat(r.path)).size === r.bytes, "mogrt written: " + JSON.stringify(r));
+    try { await tool("ae_export_template", { comp_id: id, folder: path.join(dir, "mogrt") }); throw new Error("not refused"); } catch (e) { assert(/already exists/.test(e.message), "refuses to overwrite without overwrite: true: " + e.message); }
+    await tool("ae_run_script", { code: `findComp("Selftest Template").remove(); "ok"` });
+    return { controls: a2.controls.controls.map((c) => c.name), bytes: r.bytes };
+  });
   await step("ae_apply_edits dry_run", async () => { const r = await tool("ae_apply_edits", { export_id: outline, dry_run: true, edits: [{ op: "set_key", layer: "Badge", path: "ADBE Transform Group/ADBE Position", time: 2, value: [400, 180] }] }); assert(/dry run/.test(r), "dry"); return "ok"; });
   const applied = await step("ae_apply_edits", async () => { const r = await tool("ae_apply_edits", { export_id: outline, edits: [{ op: "set_key", layer: "Badge", path: "ADBE Transform Group/ADBE Position", time: 2, value: [400, 180] }, { op: "set_layer", layer: "Title", attrs: { name: "Title v2" } }] }); const id = Number(/comp id (\d+)/.exec(r)[1]); assert(id && /Title v2/.test(r), "v2 created"); return { v2: id, created: [...r.matchAll(/Created comps: ([\d, ]+)/g)].map((m) => m[1])[0] }; });
   const v2 = applied.v2;

@@ -46,7 +46,7 @@ pr_fade (opacity + audio fades). pr_sync_clips (waveform sync, stack cameras). p
 pr_run_script runs raw ExtendScript with helpers: getProject(nameOrPath), getSequence(project, nameOrId), findItem(ref),
 findBin(path, create), qeSequence(seq), makeTime(sec), timeInfo(t, seq), log(...) (collected into "output").`;
 
-const server = new McpServer({ name: "premiere-bridge", version: "1.8.0" }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: "premiere-bridge", version: "1.9.0" }, { instructions: INSTRUCTIONS });
 const text = (s) => ({ content: [{ type: "text", text: typeof s === "string" ? s : JSON.stringify(s, null, 1) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: String(e?.message ?? e) + (e?.detail ? "\n" + JSON.stringify(e.detail, null, 1) : "") }] });
 const tool = (name, def, fn) => server.registerTool(name, def, async (args) => { try { return await fn(args); } catch (e) { return fail(e); } });
@@ -541,7 +541,7 @@ tool("pr_analyze_audio", {
   const sdb = a.silence_db ?? -35, sdur = a.min_silence_seconds ?? 0.5;
   const r = await run(ff, ["-hide_banner", "-nostats", "-i", src, "-vn", "-af", `ebur128=peak=true,volumedetect,silencedetect=n=${sdb}dB:d=${sdur}`, "-f", "null", "-"], { timeout: 1800000, maxBuffer: 64 * 1024 * 1024 }).catch((e) => e);
   const log = String(r.stderr || "");
-  const num = (re) => { const m = re.exec(log); return m ? Number(m[1]) : null; };
+  const num = (re) => { const all = [...log.matchAll(new RegExp(re.source, "g"))]; return all.length ? Number(all[all.length - 1][1]) : null; };   // ebur128 prints running values; the summary block comes last
   const silences = []; const starts = [...log.matchAll(/silence_start: ([\d.]+)/g)].map((m) => Number(m[1])), ends = [...log.matchAll(/silence_end: ([\d.]+) \| silence_duration: ([\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])]);
   starts.forEach((s, i) => { const e = ends[i]; silences.push({ start: tInfo(s, fps), end: e ? tInfo(e[0], fps) : null, duration: e ? tInfo(e[1], fps) : null }); });
   return text({ source: src, sequence: seqInfo ? seqInfo.name : undefined, fps, loudness: { integratedLufs: num(/I:\s+(-?[\d.]+) LUFS/), rangeLu: num(/LRA:\s+([\d.]+) LU/), truePeakDbtp: num(/Peak:\s+(-?[\d.]+) dBFS/), meanVolumeDb: num(/mean_volume: (-?[\d.]+) dB/), maxVolumeDb: num(/max_volume: (-?[\d.]+) dB/) }, silence: { thresholdDb: sdb, minSeconds: sdur, count: silences.length, silences }, hints: { toMinus14Lufs: num(/I:\s+(-?[\d.]+) LUFS/) !== null ? +(-14 - num(/I:\s+(-?[\d.]+) LUFS/)).toFixed(1) + " dB" : undefined } });
@@ -855,7 +855,11 @@ function cuesFromWords(words, { maxChars = 32, maxLines = 2, maxSeconds = 5, min
     if (prev && (w.start - prev.end > pauseSeconds)) flush();
     const candidate = [...cur, w].map((x) => x.word).join(" ");
     const tooLong = !wrapLines(candidate, maxChars, maxLines), tooSlow = cur.length && (w.end - cur[0].start > maxSeconds);
-    if (cur.length && (tooLong || tooSlow)) flush();
+    if (cur.length && (tooLong || tooSlow)) {
+      // prefer breaking after a comma in the second half of the cue, so a short tail doesn't become a one-word cue
+      let cut = -1; for (let k = cur.length - 2; k >= Math.floor(cur.length / 2); k--) if (/[,;:]$/.test(cur[k].word)) { cut = k; break; }
+      if (cut >= 0) { const tail = cur.slice(cut + 1); cur = cur.slice(0, cut + 1); flush(); cur = tail; } else flush();
+    }
     cur.push(w);
     if (/[.!?]$/.test(w.word) && cur.length) flush();
   }
@@ -869,7 +873,7 @@ function toVtt(cues) { return "WEBVTT\n\n" + cues.map((c) => `${srtTime(c.start,
 
 tool("pr_make_captions", {
   title: "Make captions from a transcript",
-  description: `Turn a transcript (pr_transcribe, sequence mode) or explicit cues into caption cues: sentence-aware grouping with max_chars per line (default 32), max_lines (2), max_seconds per cue (5), pauses longer than pause_seconds start a new cue. Writes an .srt (and .vtt with vtt: true) and, with add_to_sequence (default true), imports it and creates a caption track on the sequence (caption_format subtitle | 608 | 708 | teletext). Subtitle tracks show in exported frames; to hard-code them into a delivered file use pr_burn_captions. Premiere can't list, delete or move caption tracks by script, so run this once, after the edit is final (cuts don't ripple captions).`,
+  description: `Turn a transcript (pr_transcribe, sequence mode) or explicit cues into caption cues: sentence-aware grouping with max_chars per line (default 32), max_lines (2), max_seconds per cue (5), pauses longer than pause_seconds start a new cue. Writes an .srt (and .vtt with vtt: true) and, with add_to_sequence (default true), imports it and creates a caption track on the sequence (caption_format subtitle | 608 | 708 | teletext). Subtitle tracks are rendered into the picture by Premiere's exports (open captions) and show in exported frames; for a clean export, render first and keep the .srt as a sidecar, or burn later with pr_burn_captions. Premiere can't list, delete or move caption tracks by script, so run this once, after the edit is final (cuts don't ripple captions).`,
   inputSchema: { sequence: Seq, transcript: z.string().optional().describe("transcript JSON path from pr_transcribe (sequence mode)"), cues: z.array(z.object({ start_seconds: z.number(), end_seconds: z.number(), text: z.string() })).optional().describe("explicit cues instead of a transcript"), max_chars: z.number().int().optional(), max_lines: z.number().int().optional(), max_seconds: z.number().optional(), min_seconds: z.number().optional(), pause_seconds: z.number().optional(), out_path: z.string().optional().describe(".srt path; default under the project's captions/ folder"), vtt: z.boolean().optional(), add_to_sequence: z.boolean().optional(), caption_format: z.string().optional(), start_seconds: z.number().optional(), bin: z.string().optional(), project: Project, dry_run: DryRun },
 }, async (a) => {
   let cues;
@@ -902,16 +906,19 @@ tool("pr_make_captions", {
 
 tool("pr_burn_captions", {
   title: "Burn captions into a video (ffmpeg)",
-  description: "Hard-code an .srt / .vtt / .ass into a rendered video with ffmpeg's subtitles filter (libass): font, size, colour, outline, bottom margin. Video is re-encoded (H.264 CRF, audio copied). Use after pr_export_recipe / pr_render when a platform needs open captions.",
-  inputSchema: { input: z.string(), captions: z.string().describe(".srt/.vtt/.ass path (pr_make_captions output)"), out_path: z.string().optional(), font: z.string().optional().describe("default Helvetica"), font_size: z.number().int().optional().describe("default 28"), color: z.string().optional().describe("hex RRGGBB, default FFFFFF"), outline: z.number().optional().describe("default 2"), margin_bottom: z.number().int().optional().describe("pixels, default 40"), crf: z.number().int().optional().describe("default 18"), dry_run: DryRun },
+  description: "Hard-code an .srt / .vtt / .ass into a video with ffmpeg's subtitles filter (libass): font, size, colour, outline, bottom margin (pixel values at the video's height). Video is re-encoded (H.264 CRF, audio copied). Note: Premiere's own exports (pr_render / pr_export_recipe) already bake a sequence's subtitle caption track into the picture, so burn only onto files that don't have them, or export before pr_make_captions.",
+  inputSchema: { input: z.string(), captions: z.string().describe(".srt/.vtt/.ass path (pr_make_captions output)"), out_path: z.string().optional(), font: z.string().optional().describe("default Helvetica"), font_size: z.number().int().optional().describe("pixels at the video height; default 4.5 % of the height (≈ 49 px at 1080p)"), color: z.string().optional().describe("hex RRGGBB, default FFFFFF"), outline: z.number().optional().describe("default 2"), margin_bottom: z.number().int().optional().describe("pixels, default 5 % of the height"), crf: z.number().int().optional().describe("default 18"), dry_run: DryRun },
 }, async (a) => {
   const ff = await ffmpegPath(); if (!ff) throw new Error("ffmpeg not found");
   if (!(await fs.stat(a.input).catch(() => null))) throw new Error("input not found: " + a.input);
   if (!(await fs.stat(a.captions).catch(() => null))) throw new Error("captions not found: " + a.captions);
   const out = a.out_path || a.input.replace(/(\.[^.]+)$/, "-captioned$1");
+  // libass sizes fonts and margins on a 288-line canvas unless the script says otherwise, so scale pixel sizes to it
+  let height = 1080; try { const pr = await run(await ffprobePath(), ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", a.input]); height = Number(pr.stdout.trim()) || 1080; } catch {}
+  const k = 288 / height, fontPx = a.font_size ?? Math.round(height * 0.045), marginPx = a.margin_bottom ?? Math.round(height * 0.05);
   const hex = (a.color || "FFFFFF").replace(/^#/, ""), bgr = hex.length === 6 ? hex.slice(4, 6) + hex.slice(2, 4) + hex.slice(0, 2) : "FFFFFF";
   const esc = (p) => p.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'").replace(/,/g, "\\,").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
-  const style = `FontName=${a.font || "Helvetica"},FontSize=${a.font_size ?? 28},PrimaryColour=&H00${bgr},OutlineColour=&H00000000,BorderStyle=1,Outline=${a.outline ?? 2},Shadow=0,MarginV=${a.margin_bottom ?? 40}`;
+  const style = `FontName=${a.font || "Helvetica"},FontSize=${Math.max(8, Math.round(fontPx * k))},PrimaryColour=&H00${bgr},OutlineColour=&H00000000,BorderStyle=1,Outline=${Math.max(1, Math.round((a.outline ?? 2) * k * 2) / 2)},Shadow=0,MarginV=${Math.round(marginPx * k)}`;
   const vf = `subtitles='${esc(a.captions)}':force_style='${style}'`;
   const args = ["-y", "-hide_banner", "-loglevel", "error", "-i", a.input, "-vf", vf, "-c:v", "libx264", "-preset", "medium", "-crf", String(a.crf ?? 18), "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", out];
   if (a.dry_run) return text({ dryRun: true, command: [ff, ...args].join(" "), out });

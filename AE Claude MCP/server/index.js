@@ -374,6 +374,31 @@ tool("ae_lint_expression", {
   inputSchema: { expression: z.string(), comp_id: z.number().int().optional(), layer: z.union([z.number().int(), z.string()]).optional(), path: z.string().optional().describe("property matchName path, default ADBE Transform Group/ADBE Position"), apply: z.boolean().optional(), dimensions: z.number().int().optional().describe("scratch property dimensions when no target: 1, 2 (default) or 3") },
 }, async ({ expression, comp_id, layer, path: ppath, apply, dimensions }) => text(await runScript("mcp/Presets.jsx", { op: "lint", expression, compId: comp_id, layer, path: ppath, apply, dimensions }, { timeoutSec: 120 })));
 
+// ------------------------------------------------------------------ Essential Graphics / Motion Graphics Templates
+const MOGRT_LIBRARY = path.join(os.homedir(), "Library", "Application Support", "Adobe", "Common", "Motion Graphics Templates");
+tool("ae_template_controls", {
+  title: "Essential Graphics controls",
+  description: "List a comp's Essential Graphics controls, add one (layer + property path, e.g. 'ADBE Text Properties/ADBE Text Document' for the text, 'ADBE Transform Group/ADBE Position', an effect parameter…, with an optional control name), or set the template name. Controls are what Premiere shows as editable parameters once the comp is exported with ae_export_template. AE offers no API to remove a control; do that in the Essential Graphics panel.",
+  inputSchema: { comp_id: z.number().int(), add: z.object({ layer: z.union([z.number().int(), z.string()]), path: z.string(), name: z.string().optional() }).optional(), template_name: z.string().optional() },
+}, async ({ comp_id, add, template_name }) => {
+  const out = {};
+  if (template_name) out.name = await runScript("mcp/Template.jsx", { op: "name", compId: comp_id, name: template_name }, { timeoutSec: 60 });
+  if (add) out.add = await runScript("mcp/Template.jsx", { op: "add", compId: comp_id, layer: add.layer, path: add.path, name: add.name }, { timeoutSec: 60 });
+  out.controls = await runScript("mcp/Template.jsx", { op: "list", compId: comp_id }, { timeoutSec: 60 });
+  return text(add || template_name ? out : out.controls);
+});
+
+tool("ae_export_template", {
+  title: "Export Motion Graphics Template (.mogrt)",
+  description: `Export a comp as a .mogrt for Premiere (pr_add_graphic / pr_set_graphic_text read its controls). Default folder is the shared library Premiere lists (${MOGRT_LIBRARY}); name defaults to the comp's template name. The project must be saved (AE insists; use ae_save / ae_save_as first). Note: in tests, AE-based templates placed and edited fine in Premiere but rendered black in scripted frame exports and direct renders (Dynamic Link); check the Program Monitor or a Media Encoder export.`,
+  inputSchema: { comp_id: z.number().int(), folder: z.string().optional(), name: z.string().optional(), overwrite: z.boolean().optional(), dry_run: DryRun },
+}, async ({ comp_id, folder, name, overwrite, dry_run }) => {
+  const dir = folder || MOGRT_LIBRARY;
+  if (dry_run) { const c = await runScript("mcp/Template.jsx", { op: "list", compId: comp_id }, { timeoutSec: 60 }); return text({ dryRun: true, plan: { comp: c.comp, folder: dir, file: path.join(dir, `${name || c.templateName || c.comp}.mogrt`), controls: c.controls } }); }
+  await fs.mkdir(dir, { recursive: true });
+  return text(await runScript("mcp/Template.jsx", { op: "export", compId: comp_id, folder: dir, name, overwrite }, { timeoutSec: 600 }));
+});
+
 // ------------------------------------------------------------------ round trip
 tool("ae_list_comps", {
   title: "List comps",

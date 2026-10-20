@@ -15,7 +15,7 @@ Lets a Claude Desktop chat read, edit, build, render and check the comps open in
 node test/selftest.mjs      # --no-render skips the render steps, --keep leaves the scratch project open
 ```
 
-Drives the real MCP server against your running After Effects and exercises **every tool** (27/27): a new project, a comp built through `ae_run_script` with the helper library (groups in order, eased 2D/1D/colour keys), fonts list + replace, presets (list, apply, ambiguous-name refusal), expression lint (scratch, invalid with line, real property restored / applied), per-character text runs and a drop-shadow layer style through export → rebuild, export / audit / edit / new version, inline and saved frames with a contact sheet, a waited render, a background batch render job, `ae_compare` against the render, import, rebuild, version cleanup, save/save-as/open, and a real modal dialog that `ae_status` detects and `ae_dismiss_dialog` clicks away. Scratch files land in `~/Library/Application Support/AE Claude Round Trip/selftest/`. It leaves AE on a blank project.
+Drives the real MCP server against your running After Effects and exercises **every tool** (29/29): a new project, a comp built through `ae_run_script` with the helper library (groups in order, eased 2D/1D/colour keys), fonts list + replace, presets (list, apply, ambiguous-name refusal), expression lint (scratch, invalid with line, real property restored / applied), per-character text runs and a drop-shadow layer style through export → rebuild, Essential Graphics controls + a .mogrt export, export / audit / edit / new version, inline and saved frames with a contact sheet, a waited render, a background batch render job, `ae_compare` against the render, import, rebuild, version cleanup, save/save-as/open, and a real modal dialog that `ae_status` detects and `ae_dismiss_dialog` clicks away. Scratch files land in `~/Library/Application Support/AE Claude Round Trip/selftest/`. It leaves AE on a blank project.
 
 ## Tools
 
@@ -35,6 +35,7 @@ Mutating tools accept `dry_run: true`. Frame results carry `seconds`, `frames` a
 | `ae_list_fonts_used` / `ae_replace_font` | Fonts per text layer/keyframe (+ AE's missing/substituted list); replace a font project-wide, reporting substitutions |
 | `ae_list_presets` / `ae_apply_preset` | Animation presets (.ffx) from the user and app Presets folders, filtered by words; apply one to a layer (path or unique name) and report the effects and animated / expression properties it added |
 | `ae_lint_expression` | Let AE evaluate an expression: on a scratch null in a temporary comp (removed afterwards), or on a given comp/layer/property with the previous expression restored unless `apply: true`. Returns `valid`, AE's error with line number, value at 0 s |
+| `ae_template_controls` / `ae_export_template` | Essential Graphics: list a comp's controls, add one (layer + property path + name), name the template; export the comp as a `.mogrt` into the shared Motion Graphics Templates library (or a folder) for Premiere's `pr_add_graphic` / `pr_set_graphic_text`. The project must be saved first |
 | `ae_list_comps` / `ae_get_comp` / `ae_get_layers` | Comps; export a comp tree → outline + `export_id`; full property JSON, or `summary: true` for an audit (in/out, parent, matte, effects + params, text, animated props with key times, expressions) |
 | `ae_apply_edits` | Edit ops applied as a new version (`set_property`, `set_key`, `add_group`, `remove_group`, `set_layer`, `add_layer`, `remove_layer`, `move_layer`, `replace_layer`, `set_comp`) |
 | `ae_rebuild_comp` / `ae_remove_versions` | Rebuild a comp tree from an export; delete versions these tools created (refuses anything not named ` vN` / ` (rebuilt)`) |
@@ -62,6 +63,10 @@ AE:  ae_list_comps { filter: "Package" }
      ae_compare { comp_id, reference: "/x/reference/01 Title.mov" }   PSNR/SSIM per frame + sheet
 Premiere (Premiere Pro Bridge): pr_build_from_timeline with { aep, comp } clips, or pr_import_ae_comps + pr_place_clips { video_only: true }
 ```
+
+## Motion Graphics Templates
+
+`ae_template_controls` uses `Property.canAddToMotionGraphicsTemplate / addToMotionGraphicsTemplateAs(comp, name)` and `CompItem.motionGraphicsTemplateName`; `ae_export_template` uses `CompItem.exportAsMotionGraphicsTemplate(false, folder)`. Two AE quirks: the export path is a *folder* (AE writes `<templateName>.mogrt` inside it; hand it a file path and it creates a folder of that name), and an unsaved project makes AE open a *Save As* sheet that blocks scripting even with the warning flag off, so the tool refuses until the project is saved. No API removes a control. In Premiere the exported template places and its controls edit (`pr_add_graphic`, `pr_set_graphic_text`), but AE-based templates rendered black in scripted frame exports and direct renders during testing (Dynamic Link); native graphics render fine. Check the Program Monitor.
 
 ## Dialogs and the shared engine
 
