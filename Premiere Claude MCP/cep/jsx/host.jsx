@@ -1146,17 +1146,20 @@ $.global.CPB = (function () {
         var from = timeArg(a, "fromSeconds", "fromFrame", seq), to = timeArg(a, "toSeconds", "toFrame", seq);
         if (from === null || to === null || to <= from) fail("give fromSeconds/toSeconds (to > from)");
         var shift = to - from, moved = 0, blocked = [], t, i, lists = [["video", seq.videoTracks], ["audio", seq.audioTracks]];
-        // anything still inside the gap blocks the ripple
-        for (t = 0; t < lists.length; t++) for (i = 0; i < lists[t][1].numTracks; i++) { var tr = lists[t][1][i]; for (var c = 0; c < tr.clips.numItems; c++) { var cl = tr.clips[c]; if (secondsOf(cl.end) > from + 0.002 && secondsOf(cl.start) < to - 0.002) blocked.push({ track: lists[t][0] + " " + i, clip: cl.name, start: timeInfo(cl.start, seq), end: timeInfo(cl.end, seq) }); } }
+        var skip = {}; if (a.skipTracks) for (var sk = 0; sk < a.skipTracks.length; sk++) skip[a.skipTracks[sk].type + " " + a.skipTracks[sk].index] = true;
+        // anything still inside the gap blocks the ripple (skipped tracks keep their clips where they are)
+        for (t = 0; t < lists.length; t++) for (i = 0; i < lists[t][1].numTracks; i++) { if (skip[lists[t][0] + " " + i]) continue; var tr = lists[t][1][i]; for (var c = 0; c < tr.clips.numItems; c++) { var cl = tr.clips[c]; if (secondsOf(cl.end) > from + 0.002 && secondsOf(cl.start) < to - 0.002) blocked.push({ track: lists[t][0] + " " + i, clip: cl.name, start: timeInfo(cl.start, seq), end: timeInfo(cl.end, seq) }); } }
         if (blocked.length) fail("clips still occupy the gap; remove or split them first", { blocked: blocked });
         if (a.dryRun) return { dryRun: true, plan: { action: "closeGap", from: timeInfo(from, seq), to: timeInfo(to, seq), shift: timeInfo(shift, seq) } };
         for (t = 0; t < lists.length; t++) for (i = 0; i < lists[t][1].numTracks; i++) {
+            if (skip[lists[t][0] + " " + i]) continue;
             var track = lists[t][1][i], later = [];
             for (var k = 0; k < track.clips.numItems; k++) if (secondsOf(track.clips[k].start) >= to - 0.002) later.push(track.clips[k]);
             later.sort(function (x, y) { return secondsOf(x.start) - secondsOf(y.start); });
             for (var m = 0; m < later.length; m++) { var clip = later[m], want = secondsOf(clip.start) - shift; try { clip.move(makeTime(-shift)); } catch (e) {} if (Math.abs(secondsOf(clip.start) - want) > 0.002) { try { var dur = secondsOf(clip.end) - secondsOf(clip.start); clip.start = makeTime(want); clip.end = makeTime(want + dur); } catch (e2) {} } if (Math.abs(secondsOf(clip.start) - want) <= 0.002) moved++; else blocked.push({ track: lists[t][0] + " " + i, clip: clip.name, wanted: timeInfo(want, seq), at: timeInfo(clip.start, seq) }); }
         }
         var out = { from: timeInfo(from, seq), to: timeInfo(to, seq), shift: timeInfo(shift, seq), clipsMoved: moved, end: timeInfo(seq.end, seq) };
+        if (a.skipTracks && a.skipTracks.length) out.skippedTracks = a.skipTracks.length;
         if (blocked.length) out.notMoved = blocked;
         return out;
     };

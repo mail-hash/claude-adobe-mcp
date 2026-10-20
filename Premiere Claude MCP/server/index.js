@@ -431,14 +431,24 @@ const tInfo = (sec, fps) => ({ seconds: +sec.toFixed(3), frames: fpsFrames(sec, 
 
 tool("pr_transcribe", {
   title: "Transcribe (word timings)",
-  description: `Speech-to-text with word timestamps, run locally with mlx_whisper (Apple silicon). Source: a sequence (its audio is rendered through Premiere, so times are sequence times and edits/levels are included), or a project item / media file (times are media times; with sequence given too, each word is also mapped to where that media sits in the sequence). Returns the text, segments, words (start/end seconds + frames + timecode), and the path of the saved transcript JSON for pr_cut_by_transcript. model: whisper-tiny/base/small/medium/large-v3 (mlx-community), default base; the first run downloads it.`,
-  inputSchema: { sequence: Seq, item: z.string().optional().describe("project item id/name or media path (instead of rendering the sequence)"), language: z.string().optional().describe("ISO code, default auto"), model: z.string().optional(), in_seconds: z.number().optional(), out_seconds: z.number().optional(), max_words: z.number().int().optional().describe("words to include inline (default 400; the JSON file has all)"), project: Project },
+  description: `Speech-to-text with word timestamps, run locally with mlx_whisper (Apple silicon). Source: a sequence (its audio is rendered through Premiere, so times are sequence times and edits/levels are included; with music or effects on other tracks pass audio_tracks: [0] to render only the dialogue track(s), otherwise Whisper hallucinates over the music), or a project item / media file (times are media times; with sequence given too, each word is also mapped to where that media sits in the sequence, and pr_cut_by_transcript / pr_duck_audio / pr_make_captions / pr_suggest_broll accept it). Returns the text, segments, inline words as [index, word, start_s, end_s, probability(, sequence_start_s)] and the path of the saved transcript JSON (full word records with frames and timecode) for the other transcript tools. Warns when the result looks like a hallucination (one token repeated). model: whisper-tiny/base/small/medium/large-v3 (mlx-community), default base; the first run downloads it.`,
+  inputSchema: { sequence: Seq, item: z.string().optional().describe("project item id/name or media path (instead of rendering the sequence)"), language: z.string().optional().describe("ISO code, default auto"), model: z.string().optional(), in_seconds: z.number().optional(), out_seconds: z.number().optional(), audio_tracks: z.array(z.number().int()).optional().describe("sequence mode: 0-based audio tracks to render (the others are muted for the render and restored after), e.g. [0] when music sits on A2"), max_words: z.number().int().optional().describe("words to include inline (default 400; the JSON file has all)"), project: Project },
 }, async (a) => {
   const wp = await whisperPath(); if (!wp) throw new Error("mlx_whisper not found. Install it with: uv tool install mlx-whisper   (or pip install mlx-whisper), then retry.");
   let src, mode, item = null, seqInfo = null, fps = 30;
   if (a.sequence || !a.item) { seqInfo = await call("getSequence", { sequence: a.sequence, clips: !!a.item, project: a.project }, { timeoutMs: 120000 }); fps = seqInfo.fps || 30; }
   if (a.item) { const m = await resolveMediaRef(a.item, a.project); src = m.mediaPath; item = m.item; mode = "media"; if (!seqInfo) { try { const pr = await run(await ffprobePath(), ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", src]); const [n, d] = pr.stdout.trim().split("/").map(Number); if (n && d) fps = n / d; } catch {} } }
-  else { const r = await sequenceWav(a.sequence, a.project, { inSeconds: a.in_seconds, outSeconds: a.out_seconds }); src = r.wav; mode = "sequence"; }
+  else {
+    // solo the wanted audio tracks for the render: mute the others, restore whatever state they had afterwards
+    const muted = [];
+    if (a.audio_tracks?.length) {
+      const want = new Set(a.audio_tracks);
+      for (const t of seqInfo.tracks.filter((t) => t.type === "audio")) if (!want.has(t.index)) { if (t.enabled === false) continue; await call("trackOp", { sequence: seqInfo.id, trackType: "audio", trackIndex: t.index, enabled: false, project: a.project }, { timeoutMs: 60000 }); muted.push(t.index); }
+      for (const i of want) if (!seqInfo.tracks.some((t) => t.type === "audio" && t.index === i)) throw new Error(`audio track ${i} not found`);
+    }
+    try { const r = await sequenceWav(seqInfo.id, a.project, { inSeconds: a.in_seconds, outSeconds: a.out_seconds }); src = r.wav; mode = "sequence"; }
+    finally { for (const i of muted) await call("trackOp", { sequence: seqInfo.id, trackType: "audio", trackIndex: i, enabled: true, project: a.project }, { timeoutMs: 60000 }).catch(() => {}); }
+  }
   const wav = await to16kWav(src);
   const outDir = path.join(SUPPORT_DIR, "transcripts"); await fs.mkdir(outDir, { recursive: true });
   const model = a.model ? (a.model.includes("/") ? a.model : `mlx-community/${a.model.startsWith("whisper-") ? a.model : "whisper-" + a.model}${/-mlx$/.test(a.model) ? "" : "-mlx"}`) : "mlx-community/whisper-base-mlx";
@@ -464,8 +474,33 @@ tool("pr_transcribe", {
   const jsonPath = path.join(outDir, `${(seqInfo?.name || item?.name || path.basename(src)).replace(/[^\w.-]+/g, "_")}-${Date.now()}.json`);
   await fs.writeFile(jsonPath, JSON.stringify(transcript, null, 1));
   const maxWords = a.max_words ?? 400;
-  return text({ transcript: jsonPath, mode, fps, language: raw.language, model, seconds: +((Date.now() - t0) / 1000).toFixed(1), placements: placements.length ? placements : undefined, text: transcript.text, segments, words: words.slice(0, maxWords), wordCount: words.length, truncated: words.length > maxWords ? `showing ${maxWords} of ${words.length} words; the JSON has all` : undefined });
+  // hallucination check: Whisper over music / noise emits one token over and over ("10, 10, 10…")
+  let warning;
+  if (words.length >= 20) { const counts = {}; for (const w of words) { const k = w.word.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ""); counts[k] = (counts[k] || 0) + 1; } const [top, n] = Object.entries(counts).sort((x, y) => y[1] - x[1])[0]; if (n / words.length > 0.3) warning = `"${top}" is ${n} of ${words.length} words: this looks like Whisper hallucinating over music or noise. Transcribe the dialogue only: pr_transcribe with audio_tracks: [<dialogue track>] (sequence) or item: <the dialogue clip> + sequence.`; }
+  const inline = words.slice(0, maxWords).map((w, i) => { const r = [i, w.word, w.start.seconds, w.end.seconds, w.probability]; if (w.sequence) r.push(w.sequence.start.seconds); return r; });
+  return text({ transcript: jsonPath, mode, fps, language: raw.language, model, seconds: +((Date.now() - t0) / 1000).toFixed(1), warning, placements: placements.length ? placements : undefined, audioTracks: a.audio_tracks, text: transcript.text, segments, words: inline, wordFormat: mode === "media" ? "[index, word, media_start_s, media_end_s, probability, sequence_start_s]" : "[index, word, start_s, end_s, probability]", wordCount: words.length, truncated: words.length > maxWords ? `showing ${maxWords} of ${words.length} words; the JSON has all` : undefined });
 });
+
+// Words of a transcript in SEQUENCE time: sequence-mode transcripts as they are; media-mode ones (pr_transcribe with item + sequence)
+// through each word's mapping onto the clips that use that media (words outside any placement are dropped).
+function sequenceWords(tr, what = "use it") {
+  if (tr.mode === "sequence") return tr.words || [];
+  const mapped = (tr.words || []).filter((w) => w.sequence).map((w) => ({ ...w, start: w.sequence.start, end: w.sequence.end, media: { start: w.start, end: w.end } }));
+  if (!mapped.length) throw new Error(`This transcript is in media time with no sequence mapping. Run pr_transcribe with sequence: (or item + sequence so the words map onto the clips) to ${what}.`);
+  return mapped;
+}
+
+// "audio 1" / "A2" / "video 0" / "V1" → { type, index } (A/V forms are 1-based like Premiere's timeline labels)
+function parseTrackRefs(refs, tracks) {
+  const out = [];
+  for (const r of refs || []) {
+    const m = /^\s*(video|audio|v|a)\s*(\d+)\s*$/i.exec(String(r)); if (!m) throw new Error(`track '${r}' should look like "audio 1" or "A2"`);
+    const type = m[1].toLowerCase().startsWith("v") ? "video" : "audio", index = m[1].length === 1 ? Number(m[2]) - 1 : Number(m[2]);
+    if (!tracks.some((t) => t.type === type && t.index === index)) throw new Error(`${type} track ${index} not found (sequence has ${tracks.filter((t) => t.type === type).length} ${type} tracks)`);
+    out.push({ type, index });
+  }
+  return out;
+}
 
 function mergeRanges(ranges, pad = 0, minGap = 0.04) {
   const rs = ranges.map((r) => ({ from: Math.max(0, r.from - pad), to: r.to + pad, labels: r.labels || [] })).sort((x, y) => x.from - y.from), out = [];
@@ -475,13 +510,12 @@ function mergeRanges(ranges, pad = 0, minGap = 0.04) {
 
 tool("pr_cut_by_transcript", {
   title: "Cut by transcript",
-  description: `Remove parts of a sequence based on a transcript from pr_transcribe (sequence mode): fillers: true removes um/uh/erm… (or give words: [...] to match, case-insensitive; phrases allowed), phrases: ["exact text to find"] removes every occurrence, ranges: [{from_seconds, to_seconds}] removes those spans, and word_ranges: [{from_word, to_word}] uses word indexes from the transcript. Ranges are padded (padding_ms, default 40), merged, then each span is razored on every track and removed with ripple (later material shifts left), last span first. dry_run lists the spans with their words. Markers can be added instead of cutting (mark_only: true).`,
-  inputSchema: { sequence: Seq, transcript: z.string().describe("path returned by pr_transcribe"), fillers: z.boolean().optional(), words: z.array(z.string()).optional(), phrases: z.array(z.string()).optional(), ranges: z.array(z.object({ from_seconds: z.number(), to_seconds: z.number() })).optional(), word_ranges: z.array(z.object({ from_word: z.number().int(), to_word: z.number().int() })).optional(), padding_ms: z.number().optional(), min_confidence: z.number().optional().describe("skip filler matches below this probability (default 0)"), mark_only: z.boolean().optional(), project: Project, dry_run: DryRun },
+  description: `Remove parts of a sequence based on a transcript from pr_transcribe (sequence mode): fillers: true removes um/uh/erm… (or give words: [...] to match, case-insensitive; phrases allowed), phrases: ["exact text to find"] removes every occurrence, ranges: [{from_seconds, to_seconds}] removes those spans, and word_ranges: [{from_word, to_word}] uses word indexes from the transcript. Ranges are padded (padding_ms, default 40), merged, then each span is razored on every track and removed with ripple (later material shifts left), last span first. keep_tracks: ["audio 1"] leaves a music bed (or any track) uncut and in place: it is neither razored nor shortened, so a bed that spans the cut keeps playing continuously while the dialogue tightens on top of it. dry_run lists the spans with their words. Markers can be added instead of cutting (mark_only: true).`,
+  inputSchema: { sequence: Seq, transcript: z.string().describe("path returned by pr_transcribe"), keep_tracks: z.array(z.string()).optional().describe('tracks to leave untouched, as "audio 1" / "A2" / "video 2" / "V3" (A/V numbering is 1-based like the timeline)'), fillers: z.boolean().optional(), words: z.array(z.string()).optional(), phrases: z.array(z.string()).optional(), ranges: z.array(z.object({ from_seconds: z.number(), to_seconds: z.number() })).optional(), word_ranges: z.array(z.object({ from_word: z.number().int(), to_word: z.number().int() })).optional(), padding_ms: z.number().optional(), min_confidence: z.number().optional().describe("skip filler matches below this probability (default 0)"), mark_only: z.boolean().optional(), project: Project, dry_run: DryRun },
 }, async (a) => {
   const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
-  if (tr.mode !== "sequence") throw new Error("This transcript is in media time (item mode). Run pr_transcribe with sequence: to cut by it.");
   const seqInfo = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 });
-  const fps = seqInfo.fps || tr.fps || 30, words = tr.words || [], norm = (s) => String(s).toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, "").trim();
+  const fps = seqInfo.fps || tr.fps || 30, words = sequenceWords(tr, "cut by it"), norm = (s) => String(s).toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, "").trim();
   const spans = [];
   const matchList = [...(a.fillers ? DEFAULT_FILLERS : []), ...(a.words || [])].map(norm).filter(Boolean);
   if (matchList.length) {
@@ -510,10 +544,15 @@ tool("pr_cut_by_transcript", {
     return text({ sequence: seqInfo.name, marked: added.length, spans: merged });
   }
   const results = [];
+  const keep = parseTrackRefs(a.keep_tracks, seqInfo.tracks);
+  const cutTracks = seqInfo.tracks.filter((t) => !keep.some((k) => k.type === t.type && k.index === t.index));
+  if (!cutTracks.length) throw new Error("keep_tracks leaves no track to cut");
   for (const s of [...merged].reverse()) {
-    await call("splitClip", { sequence: seqInfo.id, atFrame: s.from.frames, allTracks: true, project: a.project }, { timeoutMs: 60000 });
-    await call("splitClip", { sequence: seqInfo.id, atFrame: s.to.frames, allTracks: true, project: a.project }, { timeoutMs: 60000 });
-    const tracks = (await call("getSequence", { sequence: seqInfo.id, clips: false, project: a.project }, { timeoutMs: 60000 })).tracks;
+    for (const f of [s.from.frames, s.to.frames]) {
+      if (!keep.length) await call("splitClip", { sequence: seqInfo.id, atFrame: f, allTracks: true, project: a.project }, { timeoutMs: 60000 });
+      else for (const t of cutTracks) await call("splitClip", { sequence: seqInfo.id, trackType: t.type, trackIndex: t.index, atFrame: f, project: a.project }, { timeoutMs: 60000 }).catch((e) => { if (!/no clip/i.test(e.message)) throw e; });
+    }
+    const tracks = cutTracks;
     let removed = 0;
     // half-frame margins: only pieces strictly inside the span (the razor made their edges land on these frames)
     for (const t of tracks) { const r = await call("removeClips", { sequence: seqInfo.id, trackType: t.type, trackIndex: t.index, fromSeconds: (s.from.frames + 0.5) / fps, toSeconds: (s.to.frames - 0.5) / fps, overlapping: true, ripple: false, project: a.project }, { timeoutMs: 60000 }); removed += r.removed.length; }
@@ -522,11 +561,11 @@ tool("pr_cut_by_transcript", {
   // close the gaps: ripple-delete empty space by shifting everything after each span left (last span first keeps earlier times valid)
   const closed = [];
   for (const s of [...merged].reverse()) {
-    const r = await call("closeGap", { sequence: seqInfo.id, fromFrame: s.from.frames, toFrame: s.to.frames, project: a.project }, { timeoutMs: 120000 });
+    const r = await call("closeGap", { sequence: seqInfo.id, fromFrame: s.from.frames, toFrame: s.to.frames, skipTracks: keep, project: a.project }, { timeoutMs: 120000 });
     closed.push(r);
   }
   const final = await call("getSequence", { sequence: seqInfo.id, clips: false, project: a.project }, { timeoutMs: 60000 });
-  return text({ sequence: final.name, spans: results.reverse(), removedSeconds: +removedTotal.toFixed(3), gapsClosed: closed.reverse(), end: final.end, note: "Transcript times are now stale for the removed spans; re-run pr_transcribe before cutting again." });
+  return text({ sequence: final.name, spans: results.reverse(), removedSeconds: +removedTotal.toFixed(3), keptTracks: keep.length ? keep.map((k) => k.type + " " + k.index) : undefined, gapsClosed: closed.reverse(), end: final.end, note: "Transcript times are now stale for the removed spans; re-run pr_transcribe before cutting again." });
 });
 
 tool("pr_analyze_audio", {
@@ -565,9 +604,8 @@ tool("pr_duck_audio", {
   if (a.under_track_index !== undefined) { const t = seq.tracks.find((x) => x.type === "audio" && x.index === a.under_track_index); if (!t) throw new Error(`audio track ${a.under_track_index} not found`); ranges.push(...(t.clips || []).filter((c) => c.enabled !== false).map((c) => ({ from: c.start.seconds, to: c.end.seconds }))); }
   if (a.transcript) {
     const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
-    if (tr.mode !== "sequence") throw new Error("transcript is in media time; run pr_transcribe with sequence: for ducking");
     const gap = a.speech_gap_seconds ?? 1; let cur = null;
-    for (const w of tr.words || []) { if (cur && w.start.seconds - cur.to <= gap) cur.to = Math.max(cur.to, w.end.seconds); else { cur = { from: w.start.seconds, to: w.end.seconds }; ranges.push(cur); } }
+    for (const w of sequenceWords(tr, "duck under it")) { if (cur && w.start.seconds - cur.to <= gap) cur.to = Math.max(cur.to, w.end.seconds); else { cur = { from: w.start.seconds, to: w.end.seconds }; ranges.push(cur); } }
   }
   if (!ranges.length) throw new Error("give under_track_index, transcript or ranges");
   ranges = mergeRanges(ranges, 0, fade);
@@ -881,8 +919,7 @@ tool("pr_make_captions", {
   else {
     if (!a.transcript) throw new Error("give transcript (path from pr_transcribe) or cues");
     const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
-    if (tr.mode !== "sequence") throw new Error("transcript is in media time; run pr_transcribe with sequence: so cue times match the timeline");
-    cues = cuesFromWords((tr.words || []).map((w) => ({ word: w.word, start: w.start.seconds, end: w.end.seconds })), { maxChars: a.max_chars, maxLines: a.max_lines, maxSeconds: a.max_seconds, minSeconds: a.min_seconds, pauseSeconds: a.pause_seconds });
+    cues = cuesFromWords(sequenceWords(tr, "make captions from it").map((w) => ({ word: w.word, start: w.start.seconds, end: w.end.seconds })), { maxChars: a.max_chars, maxLines: a.max_lines, maxSeconds: a.max_seconds, minSeconds: a.min_seconds, pauseSeconds: a.pause_seconds });
   }
   if (!cues.length) throw new Error("no cues (empty transcript?)");
   const seq = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 });
@@ -976,8 +1013,7 @@ tool("pr_suggest_broll", {
   inputSchema: { sequence: Seq, transcript: z.string(), min_seconds: z.number().optional(), max_talk_seconds: z.number().optional(), keywords: z.array(z.string()).optional(), candidates_folder: z.string().optional(), add_markers: z.boolean().optional(), limit: z.number().int().optional(), project: Project },
 }, async (a) => {
   const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
-  if (tr.mode !== "sequence") throw new Error("transcript is in media time; run pr_transcribe with sequence:");
-  const fps = tr.fps || 30, words = tr.words || [], minS = a.min_seconds ?? 4, maxTalk = a.max_talk_seconds ?? 10;
+  const fps = tr.fps || 30, words = sequenceWords(tr, "suggest B-roll from it"), minS = a.min_seconds ?? 4, maxTalk = a.max_talk_seconds ?? 10;
   const norm = (w) => String(w).toLowerCase().replace(/[^\p{L}\p{N}']+/gu, "");
   const userKw = (a.keywords || []).map((k) => k.toLowerCase());
   // sentences
@@ -1421,6 +1457,149 @@ tool("pr_review_sheet", {
   fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   return { content: [{ type: "image", data, mimeType: "image/png" }, { type: "text", text: lines.join("\n") }] };
 });
+
+// ---- review page: a local HTML page with the rendered sequence, timed notes → sequence markers
+const REVIEW_COLORS = ["green", "red", "purple", "orange", "yellow", "white", "blue", "cyan"];
+function reviewPageHtml(info) {
+  const data = JSON.stringify(info).replace(/</g, "\\u003c");
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Review: ${info.sequence.name.replace(/[&<>]/g, "")}</title>
+<style>
+:root{color-scheme:dark;--bg:#111;--panel:#1c1c1e;--line:#2c2c2e;--fg:#eee;--dim:#9a9a9a;--acc:#4ea1ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 -apple-system,Helvetica,Arial,sans-serif}
+header{display:flex;gap:16px;align-items:baseline;padding:10px 16px;border-bottom:1px solid var(--line)}header h1{font-size:16px;margin:0}header .dim{color:var(--dim)}
+main{display:grid;grid-template-columns:minmax(0,2fr) minmax(320px,1fr);gap:16px;padding:16px}
+video{width:100%;background:#000;border-radius:6px;outline:none}
+.bar{position:relative;height:28px;margin:8px 0;background:var(--panel);border-radius:4px;overflow:hidden;cursor:pointer}
+.bar .clip{position:absolute;top:0;height:100%;border-left:1px solid #000;background:#2a3a4a}.bar .clip.alt{background:#34475a}
+.bar .mk{position:absolute;top:0;width:2px;height:100%;opacity:.9}.bar .note{position:absolute;bottom:0;width:0;height:0;border:6px solid transparent;border-bottom-width:9px;transform:translateX(-6px)}
+.bar .head{position:absolute;top:0;width:2px;height:100%;background:#fff}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}.row .tc{font-family:ui-monospace,Menlo,monospace;font-size:18px;min-width:120px}
+button{background:#2c2c2e;color:var(--fg);border:1px solid #3a3a3c;border-radius:5px;padding:6px 10px;cursor:pointer}button:hover{background:#3a3a3c}button.primary{background:var(--acc);border-color:var(--acc);color:#000}
+input,textarea,select{background:var(--panel);color:var(--fg);border:1px solid #3a3a3c;border-radius:5px;padding:6px 8px;font:inherit}textarea{width:100%;min-height:64px;resize:vertical}
+aside{background:var(--panel);border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:10px;max-height:calc(100vh - 80px);overflow:auto}
+.notes{list-style:none;margin:0;padding:0}.notes li{display:grid;grid-template-columns:10px 1fr auto;gap:8px;padding:8px;border-top:1px solid var(--line);cursor:pointer}.notes li:hover{background:#242426}
+.notes .sw{width:10px;height:10px;border-radius:50%;margin-top:5px}.notes .t{font-family:ui-monospace,Menlo,monospace;color:var(--dim);font-size:12px}.notes .x{background:none;border:none;color:var(--dim);font-size:16px;padding:0 4px}
+.sw.green{background:#2ecc71}.sw.red{background:#e74c3c}.sw.purple{background:#9b59b6}.sw.orange{background:#e67e22}.sw.yellow{background:#f1c40f}.sw.white{background:#eee}.sw.blue{background:#3498db}.sw.cyan{background:#1abc9c}
+.mk.green{background:#2ecc71}.mk.red{background:#e74c3c}.mk.purple{background:#9b59b6}.mk.orange{background:#e67e22}.mk.yellow{background:#f1c40f}.mk.white{background:#eee}.mk.blue{background:#3498db}.mk.cyan{background:#1abc9c}
+.note.green{border-bottom-color:#2ecc71}.note.red{border-bottom-color:#e74c3c}.note.purple{border-bottom-color:#9b59b6}.note.orange{border-bottom-color:#e67e22}.note.yellow{border-bottom-color:#f1c40f}.note.white{border-bottom-color:#eee}.note.blue{border-bottom-color:#3498db}.note.cyan{border-bottom-color:#1abc9c}
+.hint{color:var(--dim);font-size:12px}.existing{font-size:12px;color:var(--dim)}.existing b{color:var(--fg)}
+@media (max-width:900px){main{grid-template-columns:1fr}aside{max-height:none}}
+</style></head><body>
+<header><h1>${info.sequence.name.replace(/[&<>]/g, "")}</h1><span class="dim">${info.project.replace(/[&<>]/g, "")} · ${info.fps} fps · ${info.duration.timecode} · rendered ${info.rendered.replace(/[&<>]/g, "")}</span></header>
+<main>
+<section>
+<video id="v" src="${info.video}" controls preload="auto"></video>
+<div class="bar" id="bar" title="click to seek"></div>
+<div class="row"><span class="tc" id="tc">00:00:00:00</span>
+<button id="back">−1 f</button><button id="fwd">+1 f</button><button id="play">Play / pause</button>
+<span class="hint">Space play/pause · ← → one frame · ⇧← ⇧→ one second · N note at playhead · O set note end · Enter saves the note</span></div>
+<div class="row"><input id="text" placeholder="Note at the playhead… (N)" style="flex:1;min-width:240px">
+<select id="color">${REVIEW_COLORS.map((c) => `<option${c === "red" ? " selected" : ""}>${c}</option>`).join("")}</select>
+<button id="setout" title="use the playhead as the note's end">Set end</button><span id="outlbl" class="hint"></span>
+<button class="primary" id="add">Add note</button></div>
+<div class="existing" id="existing"></div>
+</section>
+<aside>
+<div class="row" style="justify-content:space-between"><b id="count">0 notes</b><span><input id="who" placeholder="reviewer" style="width:120px"></span></div>
+<ul class="notes" id="notes"></ul>
+<div class="row"><button class="primary" id="save">Save notes (JSON)</button><button id="copy">Copy JSON</button><button id="clear">Clear all</button></div>
+<div class="hint">Save writes <code>${info.notesFile}</code> to your Downloads. Then in Claude: <i>pr_review_notes_to_markers</i> turns the notes into sequence markers (newest notes file is picked up automatically).</div>
+</aside>
+</main>
+<script>
+const INFO=${data};const fps=INFO.fps,dur=INFO.duration.seconds,key="review-notes:"+INFO.sequence.id;
+const v=document.getElementById("v"),bar=document.getElementById("bar"),tcEl=document.getElementById("tc"),list=document.getElementById("notes"),text=document.getElementById("text"),color=document.getElementById("color"),who=document.getElementById("who"),outlbl=document.getElementById("outlbl");
+let notes=[],outSec=null;try{notes=JSON.parse(localStorage.getItem(key)||"[]");who.value=localStorage.getItem("review-notes:who")||""}catch(e){}
+const pad=n=>String(n).padStart(2,"0");function tc(s){const f=Math.round(s*fps),r=Math.round(fps),ff=f%r,ss=Math.floor(f/r);return pad(Math.floor(ss/3600))+":"+pad(Math.floor(ss/60)%60)+":"+pad(ss%60)+":"+pad(ff)}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function drawBar(){bar.innerHTML="";let i=0;for(const c of INFO.clips){const d=document.createElement("div");d.className="clip"+(i++%2?" alt":"");d.style.left=(c.start/dur*100)+"%";d.style.width=((c.end-c.start)/dur*100)+"%";d.title=c.name+" "+tc(c.start);bar.appendChild(d)}
+for(const m of INFO.markers){const d=document.createElement("div");d.className="mk "+(m.color||"green");d.style.left=(m.seconds/dur*100)+"%";d.title=(m.name||m.type)+" "+tc(m.seconds);bar.appendChild(d)}
+for(const n of notes){const d=document.createElement("div");d.className="note "+n.color;d.style.left=(n.seconds/dur*100)+"%";d.title=n.text;bar.appendChild(d)}
+const h=document.createElement("div");h.className="head";h.id="head";bar.appendChild(h);tick()}
+function tick(){const t=v.currentTime||0;tcEl.textContent=tc(t);const h=document.getElementById("head");if(h)h.style.left=(t/dur*100)+"%"}
+function save(){try{localStorage.setItem(key,JSON.stringify(notes));localStorage.setItem("review-notes:who",who.value)}catch(e){}}
+function render(){notes.sort((a,b)=>a.seconds-b.seconds);list.innerHTML="";for(const [i,n] of notes.entries()){const li=document.createElement("li");li.innerHTML='<span class="sw '+n.color+'"></span><div><div class="t">'+tc(n.seconds)+(n.end_seconds!=null?" → "+tc(n.end_seconds):"")+'</div><div>'+esc(n.text)+'</div></div><button class="x" title="delete">×</button>';li.onclick=e=>{if(e.target.className==="x"){notes.splice(i,1);save();render();drawBar()}else{v.currentTime=n.seconds;v.pause()}};list.appendChild(li)}
+document.getElementById("count").textContent=notes.length+" note"+(notes.length===1?"":"s");save()}
+function addNote(){const t=text.value.trim();if(!t){text.focus();return}const s=Math.round(v.currentTime*fps)/fps;const n={seconds:+s.toFixed(4),timecode:tc(s),text:t,color:color.value};if(outSec!=null&&outSec>s){n.end_seconds=+outSec.toFixed(4);n.end_timecode=tc(outSec)}notes.push(n);text.value="";outSec=null;outlbl.textContent="";render();drawBar()}
+function payload(){return{sequence:INFO.sequence,project:INFO.project,fps,reviewer:who.value||undefined,exported:new Date().toISOString(),notes}}
+document.getElementById("add").onclick=addNote;text.addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();addNote()}});
+document.getElementById("setout").onclick=()=>{outSec=v.currentTime;outlbl.textContent="end "+tc(outSec)};
+document.getElementById("play").onclick=()=>v.paused?v.play():v.pause();
+document.getElementById("back").onclick=()=>{v.pause();v.currentTime=Math.max(0,v.currentTime-1/fps)};document.getElementById("fwd").onclick=()=>{v.pause();v.currentTime=Math.min(dur,v.currentTime+1/fps)};
+bar.onclick=e=>{const r=bar.getBoundingClientRect();v.currentTime=Math.max(0,Math.min(dur,(e.clientX-r.left)/r.width*dur))};
+document.getElementById("save").onclick=()=>{const b=new Blob([JSON.stringify(payload(),null,1)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=INFO.notesFile;a.click()};
+document.getElementById("copy").onclick=()=>navigator.clipboard.writeText(JSON.stringify(payload(),null,1));
+document.getElementById("clear").onclick=()=>{if(confirm("Delete all notes on this page?")){notes=[];render();drawBar()}};
+document.addEventListener("keydown",e=>{if(e.target===text||e.target===who)return;const step=e.shiftKey?1:1/fps;if(e.key===" "){e.preventDefault();v.paused?v.play():v.pause()}else if(e.key==="ArrowLeft"){e.preventDefault();v.pause();v.currentTime=Math.max(0,v.currentTime-step)}else if(e.key==="ArrowRight"){e.preventDefault();v.pause();v.currentTime=Math.min(dur,v.currentTime+step)}else if(e.key==="n"||e.key==="N"){e.preventDefault();v.pause();text.focus()}else if(e.key==="o"||e.key==="O"){e.preventDefault();document.getElementById("setout").click()}});
+v.addEventListener("timeupdate",tick);setInterval(tick,100);who.addEventListener("change",save);
+document.getElementById("existing").innerHTML=INFO.markers.length?"<b>"+INFO.markers.length+" marker"+(INFO.markers.length===1?"":"s")+" already on the sequence:</b> "+INFO.markers.map(m=>esc((m.name||m.type)+" @ "+tc(m.seconds))).join(" · "):"No markers on the sequence yet.";
+drawBar();render();
+</script></body></html>`;
+}
+
+tool("pr_review_page", {
+  title: "Review page (timed notes on a rendered sequence)",
+  description: `Render a sequence (recipe youtube_720 by default; any pr_export_recipe video recipe) and write a self-contained local HTML review page next to it: the video with frame stepping, a bar showing clips and existing markers, and timed notes (N at the playhead, optional end point, colour). Notes persist in the browser; "Save notes" downloads review-notes-<sequence>.json, which pr_review_notes_to_markers turns into sequence markers. open: true (default) opens the page in the default browser. reuse_video: true skips the render when the page's video already exists.`,
+  inputSchema: { sequence: Seq, recipe: z.string().optional().describe("youtube_720 (default) | youtube_1080 | match_source | …"), out_dir: z.string().optional().describe("folder for the page and video; default ~/Library/Application Support/Premiere Claude Bridge/review/<sequence>"), open: z.boolean().optional(), reuse_video: z.boolean().optional(), project: Project, dry_run: DryRun },
+}, async (a) => {
+  const recipe = a.recipe || "youtube_720", rc = RECIPES[recipe]; if (!rc || rc.reframe || /mp3|wav/.test(recipe)) throw new Error(`recipe '${recipe}' is not a plain video recipe (use youtube_720, youtube_1080 or match_source)`);
+  const seq = await call("getSequence", { sequence: a.sequence, project: a.project }, { timeoutMs: 120000 });
+  const st = await call("status", {}, { timeoutMs: 20000 });
+  const dir = a.out_dir || path.join(SUPPORT_DIR, "review", seq.name.replace(/[^\w.-]+/g, "_"));
+  const video = path.join(dir, "video.mp4"), page = path.join(dir, "review.html");
+  if (a.dry_run) return text({ dryRun: true, plan: { sequence: seq.name, recipe, video, page } });
+  await fs.mkdir(dir, { recursive: true });
+  let rendered = "reused";
+  if (!(a.reuse_video && (await fs.stat(video).catch(() => null)))) {
+    let presetPath = null; for (const frag of rc.preset) { const m = await findPresets(frag); const exact = m.filter((p) => path.basename(p, ".epr").toLowerCase() === frag.toLowerCase()); if (exact.length) { presetPath = exact[0]; break; } if (m.length === 1) { presetPath = m[0]; break; } }
+    if (!presetPath) throw new Error(`no export preset found for ${recipe} (tried ${rc.preset.join(", ")}); see pr_list_export_presets`);
+    const t0 = Date.now();
+    const r = await call("render", { sequence: seq.id, presetPath, path: video, mode: "direct", range: "entire", project: a.project }, { timeoutMs: 3600000 });
+    if (!(await fs.stat(r.path || video).catch(() => null))) throw new Error("render produced no file: " + JSON.stringify(r).slice(0, 300));
+    if (r.path && r.path !== video) await fs.rename(r.path, video);
+    rendered = `${((Date.now() - t0) / 1000).toFixed(0)} s`;
+  }
+  const markers = (await call("listMarkers", { sequence: seq.id, project: a.project }, { timeoutMs: 60000 }).catch(() => ({ markers: [] }))).markers;
+  const clips = []; for (const t of seq.tracks.filter((t) => t.type === "video")) for (const c of t.clips || []) if (c.enabled !== false) clips.push({ name: c.name, track: `V${t.index + 1}`, start: c.start.seconds, end: c.end.seconds });
+  clips.sort((x, y) => x.start - y.start);
+  const info = { sequence: { id: seq.id, name: seq.name }, project: path.basename(st.activeProject?.path || ""), fps: seq.fps, duration: seq.end, video: "video.mp4", clips, markers: markers.map((m) => ({ seconds: m.start.seconds, name: m.name, type: m.type, color: typeof m.color === "string" ? m.color.toLowerCase() : REVIEW_COLORS[m.color] || "green" })), notesFile: `review-notes-${seq.name.replace(/[^\w.-]+/g, "_")}.json`, rendered: rendered === "reused" ? "earlier (video reused)" : new Date().toLocaleString() };
+  await fs.writeFile(page, reviewPageHtml(info));
+  if (a.open !== false) run("/usr/bin/open", [page]).catch(() => {});
+  return text({ page, video, render: rendered, clips: clips.length, existingMarkers: markers.length, notesFile: info.notesFile, next: "Add notes on the page, click 'Save notes', then pr_review_notes_to_markers (it picks the newest review-notes JSON in ~/Downloads for this sequence)." });
+});
+
+tool("pr_review_notes_to_markers", {
+  title: "Review notes → sequence markers",
+  description: `Turn the notes saved from a pr_review_page (review-notes-<sequence>.json, by default the newest one for this sequence in ~/Downloads, or notes_path, or inline notes: [{seconds, text, color?, end_seconds?}]) into sequence markers named after the note text (comments carry the reviewer and the saved timecode). replace: true first removes markers added by an earlier import (those whose comments start with the same "review:" tag). dry_run lists what would be added.`,
+  inputSchema: { sequence: Seq, notes_path: z.string().optional(), notes: z.array(z.object({ seconds: z.number(), text: z.string(), color: z.string().optional(), end_seconds: z.number().optional() })).optional(), default_color: z.string().optional().describe("marker colour when a note has none (default red)"), replace: z.boolean().optional(), project: Project, dry_run: DryRun },
+}, async (a) => {
+  const seq = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 });
+  const fps = seq.fps || 30, tag = "review:";
+  let notes = a.notes || [], source = "inline", reviewer;
+  if (!notes.length) {
+    let file = a.notes_path;
+    if (!file) {
+      const dl = path.join(os.homedir(), "Downloads"), prefix = `review-notes-${seq.name.replace(/[^\w.-]+/g, "_")}`;
+      const cands = []; for (const f of await fs.readdir(dl).catch(() => [])) if (f.startsWith(prefix) && f.endsWith(".json")) { const stt = await fs.stat(path.join(dl, f)); cands.push({ f: path.join(dl, f), m: stt.mtimeMs }); }
+      if (!cands.length) throw new Error(`no ${prefix}*.json in ~/Downloads: click "Save notes" on the review page, or pass notes_path / notes`);
+      file = cands.sort((x, y) => y.m - x.m)[0].f;
+    }
+    const j = JSON.parse(await fs.readFile(file, "utf8"));
+    if (j.sequence?.id && j.sequence.id !== seq.id) throw new Error(`these notes are for sequence '${j.sequence.name}' (${j.sequence.id}), not '${seq.name}'`);
+    notes = j.notes || []; reviewer = j.reviewer; source = file;
+  }
+  if (!notes.length) return text({ added: 0, note: "no notes" });
+  const plan = notes.map((n) => ({ startSeconds: Math.round(n.seconds * fps) / fps, endSeconds: n.end_seconds != null && n.end_seconds > n.seconds ? Math.round(n.end_seconds * fps) / fps : undefined, name: String(n.text).trim().slice(0, 120), comments: `${tag} ${reviewer ? reviewer + " · " : ""}${tcOf(n.seconds, fps)}${n.end_seconds != null ? " → " + tcOf(n.end_seconds, fps) : ""}`, color: n.color || a.default_color || "red" }));
+  if (a.dry_run) return text({ dryRun: true, source, sequence: seq.name, markers: plan.map((p) => ({ timecode: tcOf(p.startSeconds, fps), name: p.name, color: p.color })) });
+  let removed = 0;
+  if (a.replace) { const ex = (await call("listMarkers", { sequence: seq.id, project: a.project }, { timeoutMs: 60000 })).markers.filter((m) => String(m.comments || "").startsWith(tag)); if (ex.length) { const r = await call("removeMarkers", { sequence: seq.id, guids: ex.map((m) => m.guid), project: a.project }, { timeoutMs: 60000 }); removed = Array.isArray(r.removed) ? r.removed.length : (r.removed ?? ex.length); } }
+  const added = [];
+  for (const p of plan) { const r = await call("addMarker", { sequence: seq.id, ...p, project: a.project }, { timeoutMs: 60000 }); added.push({ timecode: r.marker.start.timecode, name: r.marker.name, color: r.marker.color, guid: r.marker.guid }); }
+  return text({ source, sequence: seq.name, added: added.length, removed: removed || undefined, markers: added, next: "pr_review_sheet with at_markers: true shows a frame per note." });
+});
+
 
 const AME_DIRS = () => [
   path.join(os.homedir(), "Documents", "Adobe", "Adobe Media Encoder"),
