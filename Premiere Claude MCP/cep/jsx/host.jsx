@@ -4,7 +4,7 @@
    Times: Premiere ticks are 254016000000 per second. All results carry seconds and frames. */
 // $.evalFile from inside a function would make a plain `var` local to that function; bind the namespace explicitly.
 $.global.CPB = (function () {
-    var C = { VERSION: "1.6.0" };
+    var C = { VERSION: "1.7.0" };
     var TICKS = 254016000000;
 
     // ---------------------------------------------------------------- JSON (own, prototype-free)
@@ -909,7 +909,7 @@ $.global.CPB = (function () {
         }
         var info = componentInfo(fc.comp, fc.index, clip, seq, true);
         var out = { clip: clip.name, component: fc.comp.displayName, property: info.properties[fp.index], before: before };
-        if (/Opacity/.test(String(fc.comp.matchName))) out.note = "Opacity values read back but did not change exported frames in Premiere 26.5 tests; verify in the Program Monitor.";
+        if (/Opacity/.test(String(fc.comp.matchName))) out.note = "Opacity applies in renders (pr_render / pr_export_recipe) but Premiere's frame export ignores it, so pr_export_frame / pr_review_sheet / pr_measure_color won't show it.";
         return out;
     };
 

@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { ping, callOrExplain as call, detectDialogs, detectAEDialogs, describeDialogs, dismissDialogFor, premiereProcessName, PORT } from "./bridge.js";
 
 const run = promisify(execFile);
@@ -41,10 +42,11 @@ pr_list_mogrts / pr_add_graphic / pr_get_graphic_text / pr_set_graphic_text.
 Colour: pr_color_correct (Lumetri controls by name), pr_measure_color, pr_match_color. Delivery: pr_export_recipe (youtube_4k, vertical_9x16 with
 Auto Reframe, prores_master, podcast_mp3…, verified with ffprobe). Start from footage: pr_rough_cut (folder → import, shots, assembly, markers).
 Captions: pr_make_captions (transcript → SRT/VTT → caption track), pr_burn_captions (ffmpeg open captions on a rendered file).
+pr_fade (opacity + audio fades). pr_sync_clips (waveform sync, stack cameras). pr_suggest_broll (transcript → B-roll moments, markers).
 pr_run_script runs raw ExtendScript with helpers: getProject(nameOrPath), getSequence(project, nameOrId), findItem(ref),
 findBin(path, create), qeSequence(seq), makeTime(sec), timeInfo(t, seq), log(...) (collected into "output").`;
 
-const server = new McpServer({ name: "premiere-bridge", version: "1.7.0" }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: "premiere-bridge", version: "1.8.0" }, { instructions: INSTRUCTIONS });
 const text = (s) => ({ content: [{ type: "text", text: typeof s === "string" ? s : JSON.stringify(s, null, 1) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: String(e?.message ?? e) + (e?.detail ? "\n" + JSON.stringify(e.detail, null, 1) : "") }] });
 const tool = (name, def, fn) => server.registerTool(name, def, async (args) => { try { return await fn(args); } catch (e) { return fail(e); } });
@@ -313,9 +315,42 @@ tool("pr_add_effect", {
 
 tool("pr_set_effect_property", {
   title: "Set effect property / keyframes",
-  description: `Set a property of a clip component: value (number, [x, y] for Position/Anchor, true/false, or [r, g, b, a] for colors), or keys: [{ frame | seconds, value }] in SEQUENCE time (converted to Premiere's source-time keyframes; existing keys are replaced), or clear_keys: true. Motion Position/Anchor are 0-1 fractions of the frame; Scale and Opacity are percentages; Rotation is degrees. Note: Opacity changes read back but did not show in exported frames in Premiere 26.5 tests.`,
+  description: `Set a property of a clip component: value (number, [x, y] for Position/Anchor, true/false, or [r, g, b, a] for colors), or keys: [{ frame | seconds, value }] in SEQUENCE time (converted to Premiere's source-time keyframes; existing keys are replaced), or clear_keys: true. Motion Position/Anchor are 0-1 fractions of the frame; Scale and Opacity are percentages; Rotation is degrees. Note: Opacity applies in renders but not in Premiere's frame export (pr_export_frame, pr_review_sheet), so check fades with a render.`,
   inputSchema: { ...ClipRef, component: z.union([z.string(), z.number().int()]).describe("component name (Motion, Opacity, Lumetri Color…), matchName or index"), property: z.union([z.string(), z.number().int()]).describe("property name or index"), value: z.any().optional(), keys: z.array(z.object({ frame: z.number().optional(), seconds: z.number().optional(), value: z.any() })).optional(), clear_keys: z.boolean().optional(), dry_run: DryRun },
 }, async (a) => text(await call("setEffectProperty", { ...clipRefArgs(a), component: a.component, property: a.property, value: a.value, keys: a.keys, clearKeys: a.clear_keys, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+tool("pr_fade", {
+  title: "Fade in / out (opacity + audio)",
+  description: "Fade a clip in and/or out: video opacity keyframes 0 → 100 / 100 → 0 over fade_in_seconds / fade_out_seconds (default 1 s each when given), and the matching audio clip's volume -60 → 0 dB when audio_track_index is given (or audio: true for the same index on the audio tracks). Opacity shows in renders, not in frame exports.",
+  inputSchema: { ...ClipRef, fade_in_seconds: z.number().optional(), fade_out_seconds: z.number().optional(), audio: z.boolean().optional(), audio_track_index: z.number().int().optional(), dry_run: DryRun },
+}, async (a) => {
+  if (a.fade_in_seconds === undefined && a.fade_out_seconds === undefined) throw new Error("give fade_in_seconds and/or fade_out_seconds");
+  const g = await call("getSequence", { sequence: a.sequence, project: a.project }, { timeoutMs: 120000 });
+  const fps = g.fps || 30, vIdx = a.track_index ?? 0, track = g.tracks.find((t) => t.type === (a.track_type || "video") && t.index === vIdx);
+  if (!track) throw new Error(`${a.track_type || "video"} track ${vIdx} not found`);
+  let clip = null;
+  if (a.clip_index !== undefined) clip = track.clips[a.clip_index];
+  else { const at = a.at_seconds ?? (a.at_frame !== undefined ? a.at_frame / fps : null); if (at === null) throw new Error("give clip_index or at_frame/at_seconds"); clip = track.clips.find((c) => c.start.seconds <= at && c.end.seconds > at); }
+  if (!clip) throw new Error("clip not found");
+  const s0 = clip.start.seconds, e0 = clip.end.seconds, fi = a.fade_in_seconds, fo = a.fade_out_seconds, frame = 1 / fps;
+  const keys = [];
+  if (fi) { keys.push({ seconds: s0, value: 0 }, { seconds: Math.min(s0 + fi, e0 - frame), value: 100 }); }
+  if (fo) { if (!fi) keys.push({ seconds: s0, value: 100 }); keys.push({ seconds: Math.max(e0 - fo, s0 + (fi || 0) + frame), value: 100 }, { seconds: e0 - frame, value: 0 }); }
+  else if (fi) keys.push({ seconds: e0 - frame, value: 100 });
+  const audioIdx = a.audio_track_index ?? (a.audio ? vIdx : null);
+  const plan = { clip: clip.name, track: `${track.type} ${vIdx}`, opacityKeys: keys.map((k) => ({ ...k, timecode: tcOf(k.seconds, fps) })), audioTrack: audioIdx === null ? null : `audio ${audioIdx}` };
+  if (a.dry_run) return text({ dryRun: true, plan });
+  const ref = { sequence: g.id, trackType: track.type, trackIndex: vIdx, clipIndex: clip.index, project: a.project };
+  const op = await call("setEffectProperty", { ...ref, component: "Opacity", property: "Opacity", keys }, { timeoutMs: 60000 });
+  let audioResult = null;
+  if (audioIdx !== null) {
+    const at = g.tracks.find((t) => t.type === "audio" && t.index === audioIdx);
+    const ac = at && at.clips.find((c) => Math.abs(c.start.seconds - s0) < frame && Math.abs(c.end.seconds - e0) < 1);
+    if (!ac) plan.audioNote = `no audio clip matching the video clip's span on audio ${audioIdx}`;
+    else { const akeys = keys.map((k) => ({ seconds: k.seconds, db: k.value === 0 ? -60 : 0 })); audioResult = await call("setClipVolume", { sequence: g.id, trackIndex: audioIdx, clipIndex: ac.index, keys: akeys, project: a.project }, { timeoutMs: 60000 }); }
+  }
+  return text({ ...plan, opacity: op.property.keys.map((k) => [k.time.timecode, k.value]), audio: audioResult ? audioResult.level.keys.map((k) => [k.time.timecode, k.db]) : undefined, note: "Opacity shows in renders (pr_render / pr_export_recipe), not in frame exports." });
+});
 
 tool("pr_list_transitions", {
   title: "List transitions",
@@ -886,6 +921,85 @@ tool("pr_burn_captions", {
   return text({ out, bytes: stat.size, seconds: +((Date.now() - t0) / 1000).toFixed(1), style });
 });
 
+
+// ------------------------------------------------------------------ multicam sync (audio waveform) and B-roll suggestions
+async function uvPath() { for (const c of [process.env.UV, path.join(os.homedir(), ".local", "bin", "uv"), "/opt/homebrew/bin/uv", "uv"]) { try { await run(c, ["--version"], { timeout: 10000 }); return c; } catch {} } return null; }
+const SCRIPTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "scripts");
+
+tool("pr_sync_clips", {
+  title: "Sync clips by audio waveform",
+  description: "Find the time offset of each clip relative to the first (reference) by cross-correlating their audio (ffmpeg → 8 kHz mono → numpy FFT, run through uv). Returns offsets with a confidence score. With place: true the clips are stacked on a sequence (created if missing) so they line up: video 0/1/2…, audio 0/1/2…, the earliest-starting clip at 0. Low confidence (< 3) usually means the clips don't share sound.",
+  inputSchema: { items: z.array(z.string()).min(2).describe("project item ids / unique names / media paths; the first is the reference"), sequence: z.string().optional().describe("sequence name or id to place into (created from the first clip if missing)"), place: z.boolean().optional(), max_offset_seconds: z.number().optional(), analyze_seconds: z.number().optional().describe("only use the first N seconds of each clip (default: all)"), project: Project, dry_run: DryRun },
+}, async (a) => {
+  const ff = await ffmpegPath(); if (!ff) throw new Error("ffmpeg not found");
+  const uv = await uvPath(); if (!uv) throw new Error("uv not found (needed to run numpy): curl -LsSf https://astral.sh/uv/install.sh | sh");
+  const media = []; for (const it of a.items) media.push(await resolveMediaRef(it, a.project));
+  const dir = path.join(SUPPORT_DIR, "sync", String(Date.now())); await fs.mkdir(dir, { recursive: true });
+  const wavs = [];
+  for (let i = 0; i < media.length; i++) { const out = path.join(dir, `${i}.wav`); const args = ["-y", "-loglevel", "error", "-i", media[i].mediaPath]; if (a.analyze_seconds) args.push("-t", String(a.analyze_seconds)); args.push("-vn", "-ac", "1", "-ar", "8000", "-c:a", "pcm_s16le", out); await run(ff, args, { timeout: 1800000 }); wavs.push(out); }
+  let res;
+  try { const r = await run(uv, ["run", "--with", "numpy", "--no-project", "python", path.join(SCRIPTS_DIR, "sync_audio.py"), `--max-lag=${a.max_offset_seconds ?? 600}`, ...wavs], { timeout: 1800000, maxBuffer: 16 * 1024 * 1024 }); res = JSON.parse(r.stdout.trim().split("\n").pop()); }
+  catch (e) { throw new Error("sync script failed: " + String(e.stderr || e.message).slice(-600)); }
+  const offsets = res.results.map((r, i) => ({ item: media[i].item ? media[i].item.name : path.basename(media[i].mediaPath), id: media[i].item?.id, mediaPath: media[i].mediaPath, offsetSeconds: r.offsetSeconds, confidence: r.confidence }));
+  const base = Math.min(...offsets.map((o) => o.offsetSeconds));
+  const placements = offsets.map((o, i) => ({ ...o, startSeconds: +(o.offsetSeconds - base).toFixed(4), videoTrack: i, audioTrack: i }));
+  const low = placements.filter((p) => p.confidence !== null && p.confidence < 3).map((p) => p.item);
+  if (a.dry_run || !a.place) return text({ dryRun: !!a.dry_run, offsets: placements, warnings: low.length ? [`low confidence for: ${low.join(", ")} (clips may not share audio)`] : undefined, note: "offsetSeconds > 0: the clip starts later than the reference; startSeconds is where to place it so all line up" });
+  // place
+  // make sure every clip is a project item (import paths), then create the sequence from the reference
+  for (const p of placements) if (!p.id) { const imp = await call("importFiles", { paths: [p.mediaPath], bin: "Sync", project: a.project }, { timeoutMs: 600000 }); p.id = (imp.imported?.[0] || imp.alreadyInProject?.[0])?.id; if (!p.id) throw new Error("could not import " + p.mediaPath); }
+  const seqs = await call("listSequences", { project: a.project }, { timeoutMs: 60000 });
+  let seq = seqs.sequences.find((s) => s.id === a.sequence || s.name === a.sequence);
+  if (!seq) { const created = await call("createSequence", { name: a.sequence || "Synced", fromItem: placements[0].id, project: a.project }, { timeoutMs: 120000 }); seq = { id: created.id, name: created.name }; }
+  const info = await call("getSequence", { sequence: seq.id, clips: false, project: a.project }, { timeoutMs: 60000 });
+  const haveV = info.tracks.filter((t) => t.type === "video").length, haveA = info.tracks.filter((t) => t.type === "audio").length;
+  if (placements.length > haveV || placements.length > haveA) await call("addTracks", { sequence: seq.id, video: Math.max(0, placements.length - haveV), audio: Math.max(0, placements.length - haveA), project: a.project }, { timeoutMs: 60000 });
+  const placed = [];
+  for (const p of placements) {
+    const r = await call("placeClip", { item: p.id, sequence: seq.id, trackType: "video", trackIndex: p.videoTrack, startSeconds: p.startSeconds, targetAudioTrackIndex: p.audioTrack, project: a.project }, { timeoutMs: 120000 });
+    placed.push({ item: p.item, track: `video ${p.videoTrack}`, start: r.placed?.[0]?.start || r.clip?.start, offsetSeconds: p.offsetSeconds, confidence: p.confidence });
+  }
+  return text({ sequence: { id: seq.id, name: seq.name }, placed, warnings: low.length ? [`low confidence for: ${low.join(", ")}`] : undefined, note: "Audio landed on the first free audio tracks; use pr_move_clip to_track_index if you want each camera's audio on its own track." });
+});
+
+const STOPWORDS = new Set("a an the and or but so if then than of to in on at by for with from as is are was were be been being it its this that these those i you he she we they me him her us them my your his our their what which who whom when where why how not no yes do does did done have has had having will would can could should may might must just very really also too um uh like know mean okay ok right well going go get got thing things lot bit kind sort".split(" "));
+tool("pr_suggest_broll", {
+  title: "Suggest B-roll moments",
+  description: "From a sequence-mode transcript, find stretches that want cover footage: sentences longer than min_seconds (default 4) whose nouns/keywords are listed, any passage that mentions your keywords, and long uninterrupted talking (max_talk_seconds, default 10). Optionally scores candidate files in a folder by filename words matching each moment's keywords. add_markers: true puts a yellow marker per moment named 'B-roll: <keywords>'. A heuristic, not vision: it tells you where, you choose what.",
+  inputSchema: { sequence: Seq, transcript: z.string(), min_seconds: z.number().optional(), max_talk_seconds: z.number().optional(), keywords: z.array(z.string()).optional(), candidates_folder: z.string().optional(), add_markers: z.boolean().optional(), limit: z.number().int().optional(), project: Project },
+}, async (a) => {
+  const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
+  if (tr.mode !== "sequence") throw new Error("transcript is in media time; run pr_transcribe with sequence:");
+  const fps = tr.fps || 30, words = tr.words || [], minS = a.min_seconds ?? 4, maxTalk = a.max_talk_seconds ?? 10;
+  const norm = (w) => String(w).toLowerCase().replace(/[^\p{L}\p{N}']+/gu, "");
+  const userKw = (a.keywords || []).map((k) => k.toLowerCase());
+  // sentences
+  const sentences = []; let cur = [];
+  for (const w of words) { cur.push(w); if (/[.!?]$/.test(w.word)) { sentences.push(cur); cur = []; } }
+  if (cur.length) sentences.push(cur);
+  const moments = [];
+  const kwOf = (ws) => { const c = {}; for (const w of ws) { const n = norm(w.word); if (n.length > 3 && !STOPWORDS.has(n)) c[n] = (c[n] || 0) + 1; } return Object.entries(c).sort((x, y) => (y[1] - x[1]) || (y[0].length - x[0].length)).slice(0, 5).map((e) => e[0]); };   // frequent, then longer (more specific) words first
+  for (const ws of sentences) {
+    const start = ws[0].start.seconds, end = ws[ws.length - 1].end.seconds, textS = ws.map((w) => w.word).join(" "), kws = kwOf(ws);
+    const hits = userKw.filter((k) => textS.toLowerCase().includes(k));
+    if (hits.length) moments.push({ start, end, text: textS, reason: `mentions ${hits.join(", ")}`, keywords: [...new Set([...hits, ...kws])] });
+    else if (end - start >= minS) moments.push({ start, end, text: textS, reason: `sentence of ${(end - start).toFixed(1)} s`, keywords: kws });
+  }
+  // long talking stretches without a pause > 0.7 s
+  let runStart = null, prevEnd = null, runWords = [];
+  const flushRun = () => { if (runStart !== null && prevEnd - runStart >= maxTalk) moments.push({ start: runStart, end: prevEnd, text: runWords.map((w) => w.word).join(" ").slice(0, 140) + "…", reason: `${(prevEnd - runStart).toFixed(1)} s of continuous talking`, keywords: kwOf(runWords) }); runStart = null; runWords = []; };
+  for (const w of words) { if (prevEnd !== null && w.start.seconds - prevEnd > 0.7) flushRun(); if (runStart === null) runStart = w.start.seconds; runWords.push(w); prevEnd = w.end.seconds; }
+  flushRun();
+  moments.sort((x, y) => x.start - y.start);
+  const out = moments.slice(0, a.limit ?? 40).map((m) => ({ start: tInfo(m.start, fps), end: tInfo(m.end, fps), duration: +(m.end - m.start).toFixed(2), reason: m.reason, keywords: m.keywords, text: m.text }));
+  if (a.candidates_folder) {
+    const files = (await fs.readdir(a.candidates_folder)).filter((f) => /\.(mp4|mov|mxf|m4v|mts|mkv|jpg|jpeg|png|heic)$/i.test(f));
+    for (const m of out) { m.candidates = files.map((f) => { const fw = f.toLowerCase().replace(/\.[^.]+$/, "").split(/[^a-z0-9]+/); const score = m.keywords.filter((k) => fw.some((x) => x && (x.includes(k) || k.includes(x)))).length; return { file: path.join(a.candidates_folder, f), score }; }).filter((c) => c.score > 0).sort((x, y) => y.score - x.score).slice(0, 5); }
+  }
+  let markers = 0;
+  if (a.add_markers) { const seq = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 60000 }); for (const m of out) { await call("addMarker", { sequence: seq.id, startSeconds: m.start.seconds, endSeconds: m.end.seconds, name: "B-roll: " + (m.keywords.slice(0, 3).join(", ") || m.reason), comments: m.text, color: "yellow", project: a.project }, { timeoutMs: 60000 }); markers++; } }
+  return text({ moments: out, count: out.length, markers: a.add_markers ? markers : undefined });
+});
 // ------------------------------------------------------------------ build / compare
 function normName(s) { return String(s || "").replace(/\.[^.]+$/, "").toLowerCase(); }
 
