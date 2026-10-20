@@ -4,7 +4,7 @@
    Times: Premiere ticks are 254016000000 per second. All results carry seconds and frames. */
 // $.evalFile from inside a function would make a plain `var` local to that function; bind the namespace explicitly.
 $.global.CPB = (function () {
-    var C = { VERSION: "1.4.0" };
+    var C = { VERSION: "1.6.0" };
     var TICKS = 254016000000;
 
     // ---------------------------------------------------------------- JSON (own, prototype-free)
@@ -1175,6 +1175,61 @@ $.global.CPB = (function () {
         if (!created) fail("Premiere did not create the reframed sequence");
         var st = created.getSettings();
         return { sequence: seqSummary(created), size: [st.videoFrameWidth, st.videoFrameHeight], source: { id: seq.sequenceID, name: seq.name }, note: "Auto Reframe analyses motion; the Program Monitor shows the result. The new sequence is a copy; the source is unchanged." };
+    };
+
+    // ---------------------------------------------------------------- captions (caption track from an imported SRT/VTT)
+    var CAPTION_FORMATS = { subtitle: 0, "608": 1, "708": 2, teletext: 3, open_ebu: 65539, op42: 131075, op47: 196611 };
+    C.addCaptionTrack = function (a) {
+        var seq = findSequence(a.sequence), it = requireItem(a.item);
+        var fmtKey = a.format ? String(a.format).toLowerCase().replace(/^cea-?/, "") : "subtitle";
+        if (!has(CAPTION_FORMATS, fmtKey)) fail("unknown caption format '" + a.format + "' (subtitle, 608, 708, teletext, open_ebu, op42, op47)");
+        var start = timeArg(a, "startSeconds", "startFrame", seq); if (start === null) start = 0;
+        if (a.dryRun) return { dryRun: true, plan: { action: "addCaptionTrack", sequence: seq.name, item: it.name, format: fmtKey, start: timeInfo(start, seq) } };
+        var ok = false; try { ok = seq.createCaptionTrack(it, start, CAPTION_FORMATS[fmtKey]); } catch (e) { fail("createCaptionTrack failed: " + e.message); }
+        if (!ok) fail("Premiere did not create the caption track (is '" + it.name + "' a caption file?)");
+        return { sequence: { id: seq.sequenceID, name: seq.name }, item: it.name, format: fmtKey, start: timeInfo(start, seq), note: "Premiere's API can't list or remove caption tracks; manage them in the timeline. Subtitle tracks render in exported frames and in exports that burn captions." };
+    };
+
+    // ---------------------------------------------------------------- dissolve between two adjacent clips
+    function mediaRange(clip) { // source in/out of the whole media in seconds, when known
+        try { var it = clip.projectItem; if (!it) return null; var ip = it.getInPoint(4), op = it.getOutPoint(4); if (ip && op) return { inSec: secondsOf(ip), outSec: secondsOf(op) }; } catch (e) {}
+        return null;
+    }
+    C.dissolve = function (a) {
+        var seq = findSequence(a.sequence), type = a.trackType === "audio" ? "audio" : "video", idx = Number(a.trackIndex) || 0;
+        var track = requireTrack(seq, type, idx), fps = seqFps(seq), frameSec = 1 / fps;
+        var cut = timeArg(a, "atSeconds", "atFrame", seq), A = null, B = null, ai = -1;
+        if (a.clipIndex !== undefined && a.clipIndex !== null) { ai = Number(a.clipIndex); if (ai < 0 || ai >= track.clips.numItems) fail("clip index out of range"); A = track.clips[ai]; cut = secondsOf(A.end); }
+        else if (cut === null) fail("give clipIndex (the first of the pair) or atFrame/atSeconds (the cut)");
+        for (var c = 0; c < track.clips.numItems; c++) { var cl = track.clips[c]; if (!A && Math.abs(secondsOf(cl.end) - cut) <= frameSec * 0.6) { A = cl; ai = c; } if (Math.abs(secondsOf(cl.start) - cut) <= frameSec * 0.6) B = cl; }
+        if (!A || !B) fail("no cut at " + tcOf(cut, fps) + " on " + type + " " + idx + " with a clip on each side" + (A ? " (nothing starts there)" : B ? " (nothing ends there)" : ""));
+        var dur = timeArg(a, "durationSeconds", "durationFrames", seq); if (dur === null) dur = 1;
+        var align = a.alignment === "end_at_cut" || a.alignment === "start_at_cut" ? a.alignment : "center";
+        var half = dur * 0.5;   // (ExtendScript mis-parses "dur / 2" inside a nested ternary as a regex literal)
+        var needA = align === "center" ? half : (align === "start_at_cut" ? dur : 0);
+        var needB = align === "center" ? half : (align === "end_at_cut" ? dur : 0);
+        var warnings = [], mA = mediaRange(A), mB = mediaRange(B);
+        var handleA = mA ? mA.outSec - secondsOf(A.outPoint) : null, handleB = mB ? secondsOf(B.inPoint) - mB.inSec : null;
+        if (handleA !== null && handleA + 1e-3 < needA) warnings.push("'" + A.name + "' has " + round(handleA) + " s of media after its out point; " + round(needA) + " s needed (Premiere shortens or refuses the transition)");
+        if (handleB !== null && handleB + 1e-3 < needB) warnings.push("'" + B.name + "' has " + round(handleB) + " s of media before its in point; " + round(needB) + " s needed");
+        var name = pickByName(transitionCatalog(type), a.transition || (type === "audio" ? "Constant Power" : "Cross Dissolve"), type + " transitions");
+        var tr = type === "audio" ? qe.project.getAudioTransitionByName(name) : qe.project.getVideoTransitionByName(name);
+        if (!tr) fail("QE returned no transition object for '" + name + "'");
+        var plan = { action: "dissolve", track: type + " " + idx, cut: timeInfo(cut, seq), between: [A.name, B.name], transition: name, duration: timeInfo(dur, seq), alignment: align, handles: { before: handleA === null ? "unknown" : round(handleA), after: handleB === null ? "unknown" : round(handleB) } };
+        if (a.dryRun) { var p = { dryRun: true, plan: plan }; if (warnings.length) p.warnings = warnings; return p; }
+        var before = transitionsOf(track, seq), qi = qeItemFor(seq, type, idx, A), tc = tcOf(dur, fps), ok = false;
+        try {
+            if (align === "center") ok = !!qi.item.addTransition(tr, false, tc);
+            else if (align === "end_at_cut") ok = !!qi.item.addTransition(tr, false, tc, "00:00:00:00", 1.0, true, true);
+            else ok = !!qi.item.addTransition(tr, false, tc, "00:00:00:00", 0.0, true, true);
+        } catch (e) { fail("addTransition failed: " + e.message); }
+        var after = transitionsOf(track, seq), added = null;
+        for (var t = 0; t < after.length; t++) { var x = after[t]; if (x.start && x.start.seconds <= cut + frameSec && x.end.seconds >= cut - frameSec) { var isNew = true; for (var u = 0; u < before.length; u++) if (before[u].nodeId === x.nodeId) isNew = false; if (isNew) added = x; } }
+        if (!added) fail("Premiere did not add the transition at the cut" + (warnings.length ? " (" + warnings.join("; ") + ")" : ""));
+        var out = { track: type + " " + idx, cut: timeInfo(cut, seq), between: [A.name, B.name], transition: added, alignment: align };
+        if (Math.abs((added.end.seconds - added.start.seconds) - dur) > frameSec * 1.5) warnings.push("Premiere shortened the transition to " + added.duration.timecode + " (not enough handle)");
+        if (warnings.length) out.warnings = warnings;
+        return out;
     };
 
     // ---------------------------------------------------------------- stills & render

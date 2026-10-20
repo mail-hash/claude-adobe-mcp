@@ -32,7 +32,7 @@ Looking at an edit: pr_review_sheet returns one labelled contact sheet of a whol
 per-frame summary; pr_show_frame shows one frame. pr_detect_shots finds cuts in a media file with ffmpeg (optionally adding Shot N markers).
 pr_build_from_edit takes an ordered shot list (durations, gaps, audio beds) and lays it out back to back, importing, building and adding a marker per shot.
 Effects: pr_get_clip_effects / pr_add_effect / pr_set_effect_property (values or keyframes in sequence time; Premiere stores keys in
-source time, the bridge converts). Transitions: pr_list_transitions / pr_add_transition / pr_remove_transitions. pr_split_clip razors,
+source time, the bridge converts). Transitions: pr_list_transitions / pr_add_transition / pr_dissolve (across a cut, handle-checked) / pr_remove_transitions. pr_split_clip razors,
 pr_trim_clip moves clip edges keeping content in place, pr_move_clip to_track_index moves across tracks. Clip speed is not
 settable through Premiere 26.5's API.
 Transcript: pr_transcribe (local mlx_whisper, word timings) then pr_cut_by_transcript (fillers / words / phrases / ranges, razor + remove +
@@ -40,10 +40,11 @@ close gaps). Audio: pr_analyze_audio (LUFS, peaks, silences), pr_set_clip_volume
 pr_list_mogrts / pr_add_graphic / pr_get_graphic_text / pr_set_graphic_text.
 Colour: pr_color_correct (Lumetri controls by name), pr_measure_color, pr_match_color. Delivery: pr_export_recipe (youtube_4k, vertical_9x16 with
 Auto Reframe, prores_master, podcast_mp3…, verified with ffprobe). Start from footage: pr_rough_cut (folder → import, shots, assembly, markers).
+Captions: pr_make_captions (transcript → SRT/VTT → caption track), pr_burn_captions (ffmpeg open captions on a rendered file).
 pr_run_script runs raw ExtendScript with helpers: getProject(nameOrPath), getSequence(project, nameOrId), findItem(ref),
 findBin(path, create), qeSequence(seq), makeTime(sec), timeInfo(t, seq), log(...) (collected into "output").`;
 
-const server = new McpServer({ name: "premiere-bridge", version: "1.5.0" }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: "premiere-bridge", version: "1.7.0" }, { instructions: INSTRUCTIONS });
 const text = (s) => ({ content: [{ type: "text", text: typeof s === "string" ? s : JSON.stringify(s, null, 1) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: String(e?.message ?? e) + (e?.detail ? "\n" + JSON.stringify(e.detail, null, 1) : "") }] });
 const tool = (name, def, fn) => server.registerTool(name, def, async (args) => { try { return await fn(args); } catch (e) { return fail(e); } });
@@ -329,6 +330,12 @@ tool("pr_add_transition", {
   inputSchema: { ...ClipRef, transition: z.string().optional(), position: z.enum(["start", "end", "both"]).optional(), duration_seconds: z.number().optional(), duration_frames: z.number().optional(), dry_run: DryRun },
 }, async (a) => text(await call("addTransition", { ...clipRefArgs(a), transition: a.transition, position: a.position, durationSeconds: a.duration_seconds, durationFrames: a.duration_frames, dryRun: a.dry_run }, { timeoutMs: 60000 })));
 
+tool("pr_dissolve", {
+  title: "Dissolve between two clips",
+  description: "Add a transition across a cut between two adjacent clips: give clip_index (the first of the pair) or at_frame/at_seconds (the cut). Checks both clips have media handles for the alignment (center default; end_at_cut / start_at_cut) and reports when Premiere would shorten it. Default Cross Dissolve for video, Constant Power for audio; duration default 1 s.",
+  inputSchema: { sequence: Seq, track_type: TrackType, track_index: z.number().int().optional(), clip_index: z.number().int().optional(), at_frame: z.number().optional(), at_seconds: z.number().optional(), transition: z.string().optional(), duration_seconds: z.number().optional(), duration_frames: z.number().optional(), alignment: z.enum(["center", "end_at_cut", "start_at_cut"]).optional(), project: Project, dry_run: DryRun },
+}, async (a) => text(await call("dissolve", { sequence: a.sequence, trackType: a.track_type, trackIndex: a.track_index ?? 0, clipIndex: a.clip_index, atFrame: a.at_frame, atSeconds: a.at_seconds, transition: a.transition, durationSeconds: a.duration_seconds, durationFrames: a.duration_frames, alignment: a.alignment, project: a.project, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
 tool("pr_remove_transitions", {
   title: "Remove transitions",
   description: "Remove transitions on a track: by indexes (from pr_list_transitions), the one under at_frame/at_seconds, a name filter, or all: true.",
@@ -514,14 +521,20 @@ tool("pr_set_clip_volume", {
 
 tool("pr_duck_audio", {
   title: "Duck music under dialogue",
-  description: "Lower the clips on an audio track (music) while another track (dialogue) has clips, or during given ranges: keyframes base_db → duck_db with fade_seconds ramps on every music clip that overlaps. dry_run lists the keyframes per clip.",
-  inputSchema: { sequence: Seq, music_track_index: z.number().int(), under_track_index: z.number().int().optional().describe("audio track whose clips define the duck ranges"), ranges: z.array(z.object({ from_seconds: z.number(), to_seconds: z.number() })).optional(), duck_db: z.number().optional().describe("default -12"), base_db: z.number().optional().describe("default 0"), fade_seconds: z.number().optional().describe("default 0.3"), project: Project, dry_run: DryRun },
+  description: "Lower the clips on an audio track (music) while another track (dialogue) has clips, wherever a transcript has speech, or during given ranges: keyframes base_db → duck_db with fade_seconds ramps on every music clip that overlaps. dry_run lists the keyframes per clip.",
+  inputSchema: { sequence: Seq, music_track_index: z.number().int(), under_track_index: z.number().int().optional().describe("audio track whose clips define the duck ranges"), transcript: z.string().optional().describe("pr_transcribe JSON (sequence mode): duck wherever there is speech"), speech_gap_seconds: z.number().optional().describe("with transcript: pauses shorter than this stay ducked (default 1)"), ranges: z.array(z.object({ from_seconds: z.number(), to_seconds: z.number() })).optional(), duck_db: z.number().optional().describe("default -12"), base_db: z.number().optional().describe("default 0"), fade_seconds: z.number().optional().describe("default 0.3"), project: Project, dry_run: DryRun },
 }, async (a) => {
   const seq = await call("getSequence", { sequence: a.sequence, project: a.project }, { timeoutMs: 120000 });
   const fps = seq.fps || 30, duck = a.duck_db ?? -12, base = a.base_db ?? 0, fade = a.fade_seconds ?? 0.3;
   let ranges = (a.ranges || []).map((r) => ({ from: r.from_seconds, to: r.to_seconds }));
   if (a.under_track_index !== undefined) { const t = seq.tracks.find((x) => x.type === "audio" && x.index === a.under_track_index); if (!t) throw new Error(`audio track ${a.under_track_index} not found`); ranges.push(...(t.clips || []).filter((c) => c.enabled !== false).map((c) => ({ from: c.start.seconds, to: c.end.seconds }))); }
-  if (!ranges.length) throw new Error("give under_track_index or ranges");
+  if (a.transcript) {
+    const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
+    if (tr.mode !== "sequence") throw new Error("transcript is in media time; run pr_transcribe with sequence: for ducking");
+    const gap = a.speech_gap_seconds ?? 1; let cur = null;
+    for (const w of tr.words || []) { if (cur && w.start.seconds - cur.to <= gap) cur.to = Math.max(cur.to, w.end.seconds); else { cur = { from: w.start.seconds, to: w.end.seconds }; ranges.push(cur); } }
+  }
+  if (!ranges.length) throw new Error("give under_track_index, transcript or ranges");
   ranges = mergeRanges(ranges, 0, fade);
   const music = seq.tracks.find((x) => x.type === "audio" && x.index === a.music_track_index); if (!music) throw new Error(`audio track ${a.music_track_index} not found`);
   const plan = [];
@@ -785,6 +798,92 @@ tool("pr_rough_cut", {
   const markers = [];
   for (const s of edit) { try { const m = await call("addMarker", { sequence: build.sequence.id, startFrame: s.start_frame, endFrame: s.end_frame, name: s.name, project: a.project }, { timeoutMs: 60000 }); markers.push(m.marker.start.timecode); } catch {} }
   return text({ sequence: build.sequence, imported: imp.imported?.length ?? 0, offline: imp.offline?.length ? imp.offline : undefined, placed: build.placed.length, markers: markers.length, totalSeconds: +total.toFixed(2), fps, edit, warnings: build.warnings?.length ? build.warnings : undefined, next: "pr_review_sheet to look at it; pr_trim_clip / pr_move_clip / pr_remove_clips to refine; pr_transcribe + pr_cut_by_transcript for dialogue." });
+});
+
+// ------------------------------------------------------------------ captions
+function srtTime(sec, sep = ",") { const ms = Math.max(0, Math.round(sec * 1000)), h = Math.floor(ms / 3600000), m = Math.floor(ms / 60000) % 60, s = Math.floor(ms / 1000) % 60, f = ms % 1000; const p = (n, w = 2) => String(n).padStart(w, "0"); return `${p(h)}:${p(m)}:${p(s)}${sep}${p(f, 3)}`; }
+function wrapLines(text, maxChars, maxLines) {
+  const words = text.split(/\s+/).filter(Boolean), lines = []; let cur = "";
+  for (const w of words) { if (cur && (cur + " " + w).length > maxChars) { lines.push(cur); cur = w; } else cur = cur ? cur + " " + w : w; }
+  if (cur) lines.push(cur);
+  if (lines.length > maxLines) return null;
+  // balance two lines when the second is much shorter
+  if (lines.length === 2 && lines[1].length < lines[0].length / 2) { const all = words; let best = lines; for (let i = 1; i < all.length; i++) { const a = all.slice(0, i).join(" "), b = all.slice(i).join(" "); if (a.length <= maxChars && b.length <= maxChars && Math.abs(a.length - b.length) < Math.abs(best[0].length - best[1].length)) best = [a, b]; } return best; }
+  return lines;
+}
+// Group transcript words into caption cues: break on sentence punctuation, on long pauses, and at the char / duration limits.
+function cuesFromWords(words, { maxChars = 32, maxLines = 2, maxSeconds = 5, minSeconds = 0.8, gapSeconds = 0.08, pauseSeconds = 0.7 } = {}) {
+  const cues = []; let cur = [];
+  const flush = () => { if (!cur.length) return; const text = cur.map((w) => w.word).join(" ").replace(/\s+([,.!?;:])/g, "$1"); const lines = wrapLines(text, maxChars, maxLines) || [text]; cues.push({ start: cur[0].start, end: cur[cur.length - 1].end, text: lines.join("\n"), words: cur.length }); cur = []; };
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i], prev = cur[cur.length - 1];
+    if (prev && (w.start - prev.end > pauseSeconds)) flush();
+    const candidate = [...cur, w].map((x) => x.word).join(" ");
+    const tooLong = !wrapLines(candidate, maxChars, maxLines), tooSlow = cur.length && (w.end - cur[0].start > maxSeconds);
+    if (cur.length && (tooLong || tooSlow)) flush();
+    cur.push(w);
+    if (/[.!?]$/.test(w.word) && cur.length) flush();
+  }
+  flush();
+  // enforce min duration and gaps between cues
+  for (let i = 0; i < cues.length; i++) { const c = cues[i]; if (c.end - c.start < minSeconds) c.end = c.start + minSeconds; if (cues[i + 1] && c.end > cues[i + 1].start - gapSeconds) c.end = Math.max(c.start + 0.3, cues[i + 1].start - gapSeconds); }
+  return cues;
+}
+function toSrt(cues) { return cues.map((c, i) => `${i + 1}\n${srtTime(c.start)} --> ${srtTime(c.end)}\n${c.text}\n`).join("\n") + "\n"; }
+function toVtt(cues) { return "WEBVTT\n\n" + cues.map((c) => `${srtTime(c.start, ".")} --> ${srtTime(c.end, ".")}\n${c.text}\n`).join("\n"); }
+
+tool("pr_make_captions", {
+  title: "Make captions from a transcript",
+  description: `Turn a transcript (pr_transcribe, sequence mode) or explicit cues into caption cues: sentence-aware grouping with max_chars per line (default 32), max_lines (2), max_seconds per cue (5), pauses longer than pause_seconds start a new cue. Writes an .srt (and .vtt with vtt: true) and, with add_to_sequence (default true), imports it and creates a caption track on the sequence (caption_format subtitle | 608 | 708 | teletext). Subtitle tracks show in exported frames; to hard-code them into a delivered file use pr_burn_captions. Premiere can't list, delete or move caption tracks by script, so run this once, after the edit is final (cuts don't ripple captions).`,
+  inputSchema: { sequence: Seq, transcript: z.string().optional().describe("transcript JSON path from pr_transcribe (sequence mode)"), cues: z.array(z.object({ start_seconds: z.number(), end_seconds: z.number(), text: z.string() })).optional().describe("explicit cues instead of a transcript"), max_chars: z.number().int().optional(), max_lines: z.number().int().optional(), max_seconds: z.number().optional(), min_seconds: z.number().optional(), pause_seconds: z.number().optional(), out_path: z.string().optional().describe(".srt path; default under the project's captions/ folder"), vtt: z.boolean().optional(), add_to_sequence: z.boolean().optional(), caption_format: z.string().optional(), start_seconds: z.number().optional(), bin: z.string().optional(), project: Project, dry_run: DryRun },
+}, async (a) => {
+  let cues;
+  if (a.cues?.length) cues = a.cues.map((c) => ({ start: c.start_seconds, end: c.end_seconds, text: c.text }));
+  else {
+    if (!a.transcript) throw new Error("give transcript (path from pr_transcribe) or cues");
+    const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
+    if (tr.mode !== "sequence") throw new Error("transcript is in media time; run pr_transcribe with sequence: so cue times match the timeline");
+    cues = cuesFromWords((tr.words || []).map((w) => ({ word: w.word, start: w.start.seconds, end: w.end.seconds })), { maxChars: a.max_chars, maxLines: a.max_lines, maxSeconds: a.max_seconds, minSeconds: a.min_seconds, pauseSeconds: a.pause_seconds });
+  }
+  if (!cues.length) throw new Error("no cues (empty transcript?)");
+  const seq = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 });
+  const st = await call("status", {}, { timeoutMs: 20000 });
+  const base = a.out_path || path.join(path.dirname(st.activeProject?.path || os.homedir()), "captions", `${seq.name.replace(/[^\w.-]+/g, "_")}.srt`);
+  const srtPath = base.replace(/\.vtt$/i, ".srt"), vttPath = srtPath.replace(/\.srt$/i, ".vtt");
+  const fps = seq.fps || 30, preview = cues.slice(0, 12).map((c) => ({ start: tcOf(c.start, fps), end: tcOf(c.end, fps), text: c.text }));
+  if (a.dry_run) return text({ dryRun: true, sequence: seq.name, cues: cues.length, totalSeconds: +cues.reduce((t, c) => t + (c.end - c.start), 0).toFixed(2), preview, srt: srtPath, vtt: a.vtt ? vttPath : undefined, addToSequence: a.add_to_sequence !== false });
+  await fs.mkdir(path.dirname(srtPath), { recursive: true });
+  await fs.writeFile(srtPath, toSrt(cues));
+  if (a.vtt) await fs.writeFile(vttPath, toVtt(cues));
+  let track = null;
+  if (a.add_to_sequence !== false) {
+    const imp = await call("importFiles", { paths: [srtPath], bin: a.bin || "Captions", project: a.project }, { timeoutMs: 120000 });
+    const item = (imp.imported || [])[0] || (imp.alreadyInProject || [])[0];
+    if (!item) throw new Error("Premiere did not import the SRT: " + JSON.stringify(imp).slice(0, 300));
+    track = await call("addCaptionTrack", { sequence: seq.id, item: item.id, format: a.caption_format || "subtitle", startSeconds: a.start_seconds, project: a.project }, { timeoutMs: 120000 });
+  }
+  return text({ sequence: seq.name, cues: cues.length, srt: srtPath, vtt: a.vtt ? vttPath : undefined, preview, captionTrack: track ? { format: track.format, start: track.start, note: track.note } : null });
+});
+
+tool("pr_burn_captions", {
+  title: "Burn captions into a video (ffmpeg)",
+  description: "Hard-code an .srt / .vtt / .ass into a rendered video with ffmpeg's subtitles filter (libass): font, size, colour, outline, bottom margin. Video is re-encoded (H.264 CRF, audio copied). Use after pr_export_recipe / pr_render when a platform needs open captions.",
+  inputSchema: { input: z.string(), captions: z.string().describe(".srt/.vtt/.ass path (pr_make_captions output)"), out_path: z.string().optional(), font: z.string().optional().describe("default Helvetica"), font_size: z.number().int().optional().describe("default 28"), color: z.string().optional().describe("hex RRGGBB, default FFFFFF"), outline: z.number().optional().describe("default 2"), margin_bottom: z.number().int().optional().describe("pixels, default 40"), crf: z.number().int().optional().describe("default 18"), dry_run: DryRun },
+}, async (a) => {
+  const ff = await ffmpegPath(); if (!ff) throw new Error("ffmpeg not found");
+  if (!(await fs.stat(a.input).catch(() => null))) throw new Error("input not found: " + a.input);
+  if (!(await fs.stat(a.captions).catch(() => null))) throw new Error("captions not found: " + a.captions);
+  const out = a.out_path || a.input.replace(/(\.[^.]+)$/, "-captioned$1");
+  const hex = (a.color || "FFFFFF").replace(/^#/, ""), bgr = hex.length === 6 ? hex.slice(4, 6) + hex.slice(2, 4) + hex.slice(0, 2) : "FFFFFF";
+  const esc = (p) => p.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'").replace(/,/g, "\\,").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
+  const style = `FontName=${a.font || "Helvetica"},FontSize=${a.font_size ?? 28},PrimaryColour=&H00${bgr},OutlineColour=&H00000000,BorderStyle=1,Outline=${a.outline ?? 2},Shadow=0,MarginV=${a.margin_bottom ?? 40}`;
+  const vf = `subtitles='${esc(a.captions)}':force_style='${style}'`;
+  const args = ["-y", "-hide_banner", "-loglevel", "error", "-i", a.input, "-vf", vf, "-c:v", "libx264", "-preset", "medium", "-crf", String(a.crf ?? 18), "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", out];
+  if (a.dry_run) return text({ dryRun: true, command: [ff, ...args].join(" "), out });
+  const t0 = Date.now();
+  try { await run(ff, args, { timeout: 3600000, maxBuffer: 16 * 1024 * 1024 }); } catch (e) { throw new Error("ffmpeg failed: " + String(e.stderr || e.message).slice(-600)); }
+  const stat = await fs.stat(out);
+  return text({ out, bytes: stat.size, seconds: +((Date.now() - t0) / 1000).toFixed(1), style });
 });
 
 // ------------------------------------------------------------------ build / compare
