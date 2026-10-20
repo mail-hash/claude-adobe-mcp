@@ -313,6 +313,67 @@ tool("ae_list_fonts_used", { title: "Fonts used", description: "Fonts used by te
 tool("ae_replace_font", { title: "Replace font", description: "Replace a font (PostScript name, e.g. 'Roboto-Bold' → 'FuturaPT-Book') on every text layer/keyframe that uses it, across the project or given comps. Reports each change and any substitution AE made (font not installed). dry_run lists the changes.", inputSchema: { from: z.string(), to: z.string(), comp_ids: z.array(z.number().int()).optional(), dry_run: DryRun } },
   async ({ from, to, comp_ids, dry_run }) => text(await runScript("mcp/Fonts.jsx", { op: "replace", from, to, compIds: comp_ids, dryRun: dry_run }, { timeoutSec: 1800 })));
 
+// ------------------------------------------------------------------ presets & expressions
+async function presetFolders() {
+  let app = "Adobe After Effects 2026";
+  try { app = await aeAppName(); } catch {}
+  const year = (/\d{4}/.exec(app) || ["2026"])[0];
+  return [
+    { kind: "user", dir: path.join(os.homedir(), "Documents", "Adobe", `After Effects ${year}`, "User Presets") },
+    { kind: "app", dir: path.join("/Applications", app, "Presets") },
+  ];
+}
+async function walkFfx(dir, depth = 0) {
+  const out = [];
+  let entries = [];
+  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) { if (depth < 8) out.push(...(await walkFfx(p, depth + 1))); }
+    else if (/\.ffx$/i.test(e.name)) out.push(p);
+  }
+  return out;
+}
+async function listPresets(filter) {
+  const folders = await presetFolders(), all = [];
+  for (const f of folders) for (const p of await walkFfx(f.dir)) all.push({ kind: f.kind, name: path.basename(p, ".ffx"), category: path.relative(f.dir, path.dirname(p)), path: p });
+  const words = String(filter || "").toLowerCase().split(/\s+/).filter(Boolean);
+  return { folders, presets: words.length ? all.filter((p) => { const hay = (p.category + "/" + p.name).toLowerCase(); return words.every((w) => hay.includes(w)); }) : all };
+}
+
+tool("ae_list_presets", {
+  title: "List animation presets",
+  description: "Animation presets (.ffx) available to After Effects: the user's User Presets folder first, then the app's Presets folder (Text, Transitions, Behaviors, Shapes, Adobe Express…). filter matches words against category + name, e.g. 'wiggle', 'text in', 'transitions dissolve'. Returns the path to pass to ae_apply_preset.",
+  inputSchema: { filter: z.string().optional(), limit: z.number().int().optional() },
+  annotations: { readOnlyHint: true },
+}, async ({ filter, limit }) => {
+  const r = await listPresets(filter);
+  const n = limit ?? 60, rows = r.presets.slice(0, n).map((p) => `${p.kind}\t${p.category}\t${p.name}\t${p.path}`);
+  return text(`${r.presets.length} preset(s)${r.presets.length > n ? `, showing ${n}` : ""} (folders: ${r.folders.map((f) => f.dir).join(" ; ")})\nkind\tcategory\tname\tpath\n${rows.join("\n")}`);
+});
+
+tool("ae_apply_preset", {
+  title: "Apply animation preset",
+  description: "Apply an animation preset (.ffx) to a layer, like dragging it from Effects & Presets: preset is an absolute path from ae_list_presets or a name fragment that matches exactly one preset. Reports the effects and animated/expression properties the preset added. Applies to the comp in place (not a new version); use ae_apply_edits afterwards for a versioned change, or dry_run first.",
+  inputSchema: { comp_id: z.number().int(), layer: z.union([z.number().int(), z.string()]).describe("layer index (1 = top), exact name, or L-id from an export"), preset: z.string(), dry_run: DryRun },
+}, async ({ comp_id, layer, preset, dry_run }) => {
+  let presetPath = preset;
+  if (!path.isAbsolute(preset) || !(await fs.stat(preset).catch(() => null))) {
+    const r = await listPresets(preset);
+    const exact = r.presets.filter((p) => p.name.toLowerCase() === preset.toLowerCase());
+    const pick = exact.length === 1 ? exact : r.presets;
+    if (pick.length !== 1) throw new Error(pick.length ? `'${preset}' matches ${pick.length} presets: ${pick.slice(0, 8).map((p) => p.category + "/" + p.name).join(", ")}${pick.length > 8 ? ", …" : ""}. Give the path.` : `No preset matches '${preset}'. Use ae_list_presets.`);
+    presetPath = pick[0].path;
+  }
+  return text(await runScript("mcp/Presets.jsx", { op: "apply", compId: comp_id, layer, preset: presetPath, dryRun: dry_run }, { timeoutSec: 120 }));
+});
+
+tool("ae_lint_expression", {
+  title: "Lint expression",
+  description: "Check an expression by letting After Effects evaluate it. Without a target it runs on a scratch null's Position (dimensions: 1 for a 1D property like Opacity) in a temporary comp that is removed afterwards. With comp_id + layer + path it is tested on that property: the previous expression is restored unless apply: true (then it stays when valid). Returns valid, AE's error text with the line number when invalid, and the value at time 0.",
+  inputSchema: { expression: z.string(), comp_id: z.number().int().optional(), layer: z.union([z.number().int(), z.string()]).optional(), path: z.string().optional().describe("property matchName path, default ADBE Transform Group/ADBE Position"), apply: z.boolean().optional(), dimensions: z.number().int().optional().describe("scratch property dimensions when no target: 1, 2 (default) or 3") },
+}, async ({ expression, comp_id, layer, path: ppath, apply, dimensions }) => text(await runScript("mcp/Presets.jsx", { op: "lint", expression, compId: comp_id, layer, path: ppath, apply, dimensions }, { timeoutSec: 120 })));
+
 // ------------------------------------------------------------------ round trip
 tool("ae_list_comps", {
   title: "List comps",

@@ -30,6 +30,7 @@ deletes such versions. Markers: pr_list_markers / pr_add_marker / pr_remove_mark
 sets in/out points (work-area changes are accepted but not applied by Premiere 26.5; the result says so).
 Looking at an edit: pr_review_sheet returns one labelled contact sheet of a whole sequence (evenly spaced, at clip starts or at markers) plus a
 per-frame summary; pr_show_frame shows one frame. pr_detect_shots finds cuts in a media file with ffmpeg (optionally adding Shot N markers).
+pr_build_from_edit takes an ordered shot list (durations, gaps, audio beds) and lays it out back to back, importing, building and adding a marker per shot.
 pr_run_script runs raw ExtendScript with helpers: getProject(nameOrPath), getSequence(project, nameOrId), findItem(ref),
 findBin(path, create), qeSequence(seq), makeTime(sec), timeInfo(t, seq), log(...) (collected into "output").`;
 
@@ -279,13 +280,7 @@ tool("pr_sequence_range", {
 // ------------------------------------------------------------------ build / compare
 function normName(s) { return String(s || "").replace(/\.[^.]+$/, "").toLowerCase(); }
 
-tool("pr_build_from_timeline", {
-  title: "Build sequence from JSON timeline",
-  description: `Build or patch a sequence from a JSON timeline, importing missing media and After Effects comps first.
-timeline = { sequence: "name or id", create_from_item?: "item to copy settings from", tracks: [ { type: "video"|"audio", index: 0, clips: [ { item?: "id or unique name", path?: "/media/file.mov", aep?: "/x.aep", comp?: "Comp name", start_frame: 0, in_frame?, out_frame?, mode?: "overwrite"|"insert", video_only?: true } ] } ] }.
-Existing clips on the listed tracks that don't match the timeline are removed (patch mode); mode "append" keeps them. dry_run reports every import/remove/place it would do.`,
-  inputSchema: { timeline: z.any(), mode: z.enum(["patch", "append"]).optional(), bin: z.string().optional().describe("bin for imported media (default 'Imported')"), project: Project, dry_run: DryRun },
-}, async ({ timeline: tl, mode, bin, project, dry_run }) => {
+async function buildFromTimeline({ timeline: tl, mode, bin, project, dry_run }) {
   if (typeof tl === "string") tl = JSON.parse(tl);
   if (!tl || !Array.isArray(tl.tracks)) throw new Error("timeline.tracks must be an array");
   const plan = { imports: [], aeImports: [], createSequence: null, removes: [], places: [], warnings: [] };
@@ -350,7 +345,7 @@ Existing clips on the listed tracks that don't match the timeline are removed (p
       places.push(spec); plan.places.push({ track: `${type} ${idx}`, item: d.it.name, start_frame: d.c.start_frame ?? null, start_seconds: d.c.start_seconds ?? null, video_only: spec.video_only });
     }
   }
-  if (dry_run) return text({ dryRun: true, sequence: seq ? seq.name : plan.createSequence?.name, plan });
+  if (dry_run) return { dryRun: true, sequence: seq ? seq.name : plan.createSequence?.name, plan };
   // 4. apply removes (clips whose start matches, by track)
   for (const r of plan.removes) { const [type, idx] = r.track.split(" "); await call("removeClips", { sequence: seqRef, trackType: type, trackIndex: Number(idx), fromFrame: r.start.frames, toFrame: r.start.frames + 1, overlapping: true, project }, { timeoutMs: 60000 }); }
   // tracks needed?
@@ -360,7 +355,131 @@ Existing clips on the listed tracks that don't match the timeline are removed (p
   if (maxV + 1 > haveV || maxA + 1 > haveA) await call("addTracks", { sequence: seqRef, video: Math.max(0, maxV + 1 - haveV), audio: Math.max(0, maxA + 1 - haveA), project }, { timeoutMs: 60000 });
   const placed = places.length ? await call("placeClips", { clips: places.map(placeArgs), sequence: seqRef, project }, { timeoutMs: 600000 }) : { results: [] };
   const final = await call("getSequence", { sequence: seqRef, project }, { timeoutMs: 120000 });
-  return text({ sequence: { id: final.id, name: final.name, fps: final.fps, end: final.end }, imported: plan.imports, aeImported: plan.aeImports, created: !!plan.createSequence, removed: plan.removes.length, placed: placed.results.map((r) => r.placed || (r.clip ? [r.clip] : [])).flat().map((c) => ({ track: c.track, name: c.name, start: c.start.frames, end: c.end.frames })), warnings: plan.warnings });
+  return { sequence: { id: final.id, name: final.name, fps: final.fps, end: final.end }, imported: plan.imports, aeImported: plan.aeImports, created: !!plan.createSequence, removed: plan.removes.length, placed: placed.results.map((r) => r.placed || (r.clip ? [r.clip] : [])).flat().map((c) => ({ track: c.track, name: c.name, start: c.start.frames, end: c.end.frames })), warnings: plan.warnings };
+}
+
+tool("pr_build_from_timeline", {
+  title: "Build sequence from JSON timeline",
+  description: `Build or patch a sequence from a JSON timeline, importing missing media and After Effects comps first.
+timeline = { sequence: "name or id", create_from_item?: "item to copy settings from", tracks: [ { type: "video"|"audio", index: 0, clips: [ { item?: "id or unique name", path?: "/media/file.mov", aep?: "/x.aep", comp?: "Comp name", start_frame: 0, in_frame?, out_frame?, mode?: "overwrite"|"insert", video_only?: true } ] } ] }.
+Existing clips on the listed tracks that don't match the timeline are removed (patch mode); mode "append" keeps them. dry_run reports every import/remove/place it would do.`,
+  inputSchema: { timeline: z.any(), mode: z.enum(["patch", "append"]).optional(), bin: z.string().optional().describe("bin for imported media (default 'Imported')"), project: Project, dry_run: DryRun },
+}, async (a) => text(await buildFromTimeline(a)));
+
+// ------------------------------------------------------------------ edit spec (ordered shots → timeline)
+const ShotRef = { item: z.string().optional().describe("project item id or unique name"), path: z.string().optional().describe("media file to import if not in the project"), aep: z.string().optional(), comp: z.string().optional().describe("After Effects comp (with aep) to Dynamic Link") };
+const EditShot = z.object({
+  ...ShotRef,
+  name: z.string().optional().describe("label for the marker / summary (default: item name)"),
+  duration_seconds: z.number().optional(), duration_frames: z.number().optional(),
+  in_seconds: z.number().optional(), in_frame: z.number().optional(),
+  gap_seconds: z.number().optional().describe("empty space before this shot"), gap_frames: z.number().optional(),
+  track: z.number().int().optional().describe("video track index (default 0)"),
+  video_only: z.boolean().optional(), marker: z.union([z.boolean(), z.string()]).optional().describe("false: no marker; string: marker name"),
+  color: MarkerColor,
+});
+const EditAudio = z.object({ ...ShotRef, name: z.string().optional(), start_seconds: z.number().optional(), start_frame: z.number().optional(), in_seconds: z.number().optional(), in_frame: z.number().optional(), duration_seconds: z.number().optional(), duration_frames: z.number().optional(), track: z.number().int().optional().describe("audio track index (default 0)") });
+
+tool("pr_build_from_edit", {
+  title: "Build sequence from an edit list",
+  description: `Higher-level than pr_build_from_timeline: an ordered list of shots, each with a duration (or its whole length), laid back to back from start_seconds (default 0), plus optional audio beds (music, VO) on audio tracks. Resolves every shot to frames at the sequence fps, imports media / AE comps that aren't in the project, builds or patches the sequence, and (markers: true, default) adds a sequence marker per shot. Returns the resolved edit (start/end per shot) and the build result; dry_run shows the resolved edit and the plan without changing anything. Shots whose duration is unknown until import need duration_seconds in dry_run.`,
+  inputSchema: {
+    sequence: z.string().describe("sequence name or id (created if missing, settings copied from the first shot)"),
+    create_from_item: z.string().optional(),
+    shots: z.array(EditShot).min(1),
+    audio: z.array(EditAudio).optional(),
+    start_seconds: z.number().optional(), start_frame: z.number().optional(),
+    fps: z.number().optional().describe("frame rate for seconds→frames when the sequence doesn't exist yet (default: first shot's media fps, else 30)"),
+    markers: z.boolean().optional().describe("add a sequence marker per shot (default true)"),
+    marker_color: MarkerColor,
+    mode: z.enum(["patch", "append"]).optional(), bin: z.string().optional(), project: Project, dry_run: DryRun,
+  },
+}, async (a) => {
+  const { project, dry_run } = a;
+  const warnings = [];
+  // 1. project items (with durations) + sequence fps
+  const items = await call("listItems", { project, durations: true, limit: 5000 }, { timeoutMs: 120000 });
+  const byId = new Map(), byName = new Map(), byPath = new Map();
+  const index = (it) => { byId.set(it.id, it); if (!byName.has(normName(it.name))) byName.set(normName(it.name), it); if (it.mediaPath) byPath.set(it.mediaPath, it); };
+  for (const it of items.items) index(it);
+  const resolve = (c) => {
+    if (c.item && byId.has(c.item)) return byId.get(c.item);
+    if (c.item && byName.has(normName(c.item))) return byName.get(normName(c.item));
+    if (c.path && byPath.has(c.path)) return byPath.get(c.path);
+    if (c.path && byName.has(normName(path.basename(c.path)))) return byName.get(normName(path.basename(c.path)));
+    if (c.comp && byName.has(normName(c.comp))) return byName.get(normName(c.comp));
+    if (c.comp) for (const [k, v] of byName) if (k.startsWith(normName(c.comp) + "/")) return v;
+    return null;
+  };
+  const all = [...a.shots, ...(a.audio || [])];
+  // 2. import what's missing first (real run), so durations are known
+  const needFiles = [...new Set(all.filter((c) => !resolve(c) && c.path).map((c) => c.path))];
+  const needComps = new Map(); for (const c of all) if (!resolve(c) && !c.path && c.aep && c.comp) { if (!needComps.has(c.aep)) needComps.set(c.aep, new Set()); needComps.get(c.aep).add(c.comp); }
+  const imported = { files: needFiles, aeComps: [...needComps].map(([aep, comps]) => ({ aep, comps: [...comps] })) };
+  if (!dry_run) {
+    if (needFiles.length) { const r = await call("importFiles", { paths: needFiles, bin: a.bin || "Imported", project }, { timeoutMs: 600000 }); for (const it of r.imported || []) index(it); if (r.offline?.length) warnings.push(`offline after import: ${r.offline.map((o) => o.name).join(", ")}`); }
+    for (const ai of imported.aeComps) { const r = await importAEComps({ aep_path: ai.aep, comp_names: ai.comps, bin: a.bin || "Imported", project }); for (const it of r.imported || []) index(it); if (r.notCreated?.length) warnings.push(`AE comps not created: ${r.notCreated.join(", ")}`); }
+  }
+  const seqs = await call("listSequences", { project }, { timeoutMs: 60000 });
+  const seq = seqs.sequences.find((s) => s.id === a.sequence || s.name === a.sequence) || null;
+  const firstIt = resolve(a.shots[0]);
+  const fps = seq?.fps || a.fps || firstIt?.frameRate || 30;
+  const fpsSource = seq ? "sequence" : a.fps ? "fps argument" : firstIt?.frameRate ? "first shot's media" : "default 30";
+  const toF = (sec) => Math.round(sec * fps);
+  const frames = (c, fKey, sKey, dflt) => c[fKey] !== undefined && c[fKey] !== null ? Number(c[fKey]) : (c[sKey] !== undefined && c[sKey] !== null ? toF(Number(c[sKey])) : dflt);
+  // 3. lay the shots back to back
+  let cursor = frames(a, "start_frame", "start_seconds", 0);
+  const resolved = [], videoTracks = new Map(), markers = [];
+  a.shots.forEach((sh, i) => {
+    const it = resolve(sh);
+    const label = sh.name || it?.name || sh.comp || (sh.path ? path.basename(sh.path) : sh.item) || `shot ${i + 1}`;
+    cursor += frames(sh, "gap_frames", "gap_seconds", 0);
+    const inF = frames(sh, "in_frame", "in_seconds", 0);
+    let dur = frames(sh, "duration_frames", "duration_seconds", null);
+    let note;
+    if (dur === null) {
+      const mediaSec = it?.duration?.seconds;
+      if (mediaSec !== undefined) { dur = Math.max(0, toF(mediaSec) - inF); note = "whole clip"; }
+      else { note = dry_run ? "duration unknown until import; give duration_seconds for an exact plan" : "duration unknown"; warnings.push(`shot ${i + 1} "${label}": ${note}`); }
+    } else if (it?.duration?.seconds !== undefined && inF + dur > toF(it.duration.seconds) + 1) warnings.push(`shot ${i + 1} "${label}": in + duration (${inF + dur} f) exceeds the media (${toF(it.duration.seconds)} f); Premiere will clamp it`);
+    const trackIdx = sh.track ?? 0;
+    const clip = { item: it ? it.id : sh.item, path: it ? undefined : sh.path, aep: it ? undefined : sh.aep, comp: it ? undefined : sh.comp, start_frame: cursor, in_frame: inF, out_frame: dur !== null ? inF + dur : undefined, video_only: sh.video_only };
+    if (!videoTracks.has(trackIdx)) videoTracks.set(trackIdx, []);
+    videoTracks.get(trackIdx).push(clip);
+    const endF = dur !== null ? cursor + dur : null;
+    resolved.push({ index: i + 1, name: label, item: it?.name || null, track: `video ${trackIdx}`, start: { frames: cursor, seconds: +(cursor / fps).toFixed(6), timecode: tcOf(cursor / fps, fps) }, end: endF !== null ? { frames: endF, seconds: +(endF / fps).toFixed(6), timecode: tcOf(endF / fps, fps) } : null, duration_frames: dur, in_frame: inF, note });
+    if (sh.marker !== false && (a.markers ?? true)) markers.push({ startFrame: cursor, endFrame: endF ?? undefined, name: typeof sh.marker === "string" ? sh.marker : label, color: sh.color ?? a.marker_color });
+    if (dur !== null) cursor += dur;
+  });
+  const audioTracks = new Map();
+  (a.audio || []).forEach((au, i) => {
+    const it = resolve(au);
+    const startF = frames(au, "start_frame", "start_seconds", 0), inF = frames(au, "in_frame", "in_seconds", 0), dur = frames(au, "duration_frames", "duration_seconds", null);
+    const trackIdx = au.track ?? 0;
+    if (!audioTracks.has(trackIdx)) audioTracks.set(trackIdx, []);
+    audioTracks.get(trackIdx).push({ item: it ? it.id : au.item, path: it ? undefined : au.path, start_frame: startF, in_frame: inF, out_frame: dur !== null ? inF + dur : undefined });
+    resolved.push({ index: `audio ${i + 1}`, name: au.name || it?.name || au.item || (au.path ? path.basename(au.path) : "?"), item: it?.name || null, track: `audio ${trackIdx}`, start: { frames: startF, seconds: +(startF / fps).toFixed(6), timecode: tcOf(startF / fps, fps) }, duration_frames: dur });
+  });
+  const timeline = { sequence: a.sequence, create_from_item: a.create_from_item, tracks: [
+    ...[...videoTracks].map(([index, clips]) => ({ type: "video", index, clips })),
+    ...[...audioTracks].map(([index, clips]) => ({ type: "audio", index, clips })),
+  ] };
+  // 4. build (or plan)
+  const build = await buildFromTimeline({ timeline, mode: a.mode, bin: a.bin, project, dry_run });
+  const out = { fps, fpsSource, totalDuration: { frames: cursor, seconds: +(cursor / fps).toFixed(6), timecode: tcOf(cursor / fps, fps) }, edit: resolved, imported, build, warnings: [...warnings, ...(build.warnings || [])] };
+  if (dry_run) { out.dryRun = true; out.markersPlanned = markers.map((m) => ({ name: m.name, start_frame: m.startFrame, end_frame: m.endFrame })); return text(out); }
+  // 5. markers (one per shot; existing markers with the same names are replaced)
+  if (markers.length) {
+    const seqRef = build.sequence.id;
+    const added = [];
+    for (const m of markers) {
+      try { await call("removeMarkers", { sequence: seqRef, filter: m.name, fromFrame: m.startFrame, toFrame: m.startFrame, project }, { timeoutMs: 60000 }); } catch {}
+      const r = await call("addMarker", { sequence: seqRef, startFrame: m.startFrame, endFrame: m.endFrame, name: m.name, color: m.color, project }, { timeoutMs: 60000 });
+      added.push({ name: r.marker.name, start: r.marker.start.timecode, end: r.marker.end.timecode });
+    }
+    out.markers = added;
+  }
+  return text(out);
 });
 
 tool("pr_compare_sequences", {

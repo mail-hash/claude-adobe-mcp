@@ -29,7 +29,7 @@ node test/selftest.mjs            # add --no-render to skip the render step, --k
 node test/selftest.mjs --ae "/path/project.aep" --comp "Comp name"   # also tests a live Dynamic Link import
 ```
 
-It drives the real MCP server and exercises **every tool** (38/38): two scratch projects, imports, a sequence from a clip, single and batch placement, replace / move / enable / remove, track ops, sequence versions (`v2` / `v3`, then deleted), markers (add, list, remove), shot detection on a generated two-colour mp4 (cut found at 1 s, `Shot N` markers added and removed), in/out points, frame exports + contact sheet, review sheets (evenly spaced and at clip starts), a direct render, scripting helpers, explicit project resolution with two projects open, `pr_build_from_timeline` (import + create + place, then an idempotent patch), `pr_compare_sequences`, and a real modal dialog raised in Premiere that `pr_status` detects and `pr_dismiss_dialog` clicks away.
+It drives the real MCP server and exercises **every tool** (39/39): two scratch projects, imports, a sequence from a clip, single and batch placement, replace / move / enable / remove, track ops, sequence versions (`v2` / `v3`, then deleted), markers (add, list, remove), shot detection on a generated two-colour mp4 (cut found at 1 s, `Shot N` markers added and removed), in/out points, frame exports + contact sheet, review sheets (evenly spaced and at clip starts), a direct render, scripting helpers, explicit project resolution with two projects open, `pr_build_from_timeline` (import + create + place, then an idempotent patch), `pr_build_from_edit` (shot list → frames, markers, idempotent), `pr_compare_sequences`, and a real modal dialog raised in Premiere that `pr_status` detects and `pr_dismiss_dialog` clicks away.
 
 ## Tools
 
@@ -49,6 +49,7 @@ Every tool accepts an optional `project` (name or `.prproj` path) and, where it 
 | `pr_replace_clip` / `pr_remove_clips` / `pr_set_clip_enabled` / `pr_move_clip` | Clip operations (replace keeps position + duration; remove by range or index; nudge by frames) |
 | `pr_set_track_enabled` / `pr_track` / `pr_add_tracks` | Track output/lock, rename, target; append tracks |
 | `pr_build_from_timeline` | Build or patch a sequence from JSON (imports missing media / AE comps first); `dry_run` reports every import/remove/place |
+| `pr_build_from_edit` | Ordered shot list → sequence: each shot has a duration (or its whole length), optional in point, gap, track and marker; audio beds on audio tracks; lays them back to back at the sequence fps, imports what's missing, builds/patches via the timeline builder, adds a marker per shot. `dry_run` returns the resolved edit (start/end per shot) and the plan |
 | `pr_compare_sequences` | Clip-by-clip diff of two sequences (any two projects): source, start/end/in/out frames, enabled |
 | `pr_duplicate_sequence` / `pr_remove_sequence` | Copy a sequence as `<name> v2` (next free `vN`) before a batch of edits, original stays active; delete such versions (refuses other names unless `force`) |
 | `pr_list_markers` / `pr_add_marker` / `pr_remove_markers` | Sequence markers: list (time range / name filter), add (point or range, name, comments, comment/chapter/segmentation/weblink, color), remove by guid / index / range / filter / all |
