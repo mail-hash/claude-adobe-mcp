@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "ae-round-trip",
   "display_name": "After Effects Round Trip",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Let Claude read, edit and preview your open After Effects comps. Edits go into new comp versions; nothing is saved.",
   "long_description": "Exports a comp and its nested precomps (layers, parenting, keyframes with easing, effects, masks, shapes, text, expressions, footage) to JSON. Claude edits that JSON, and After Effects duplicates the comp as a new version (v2, v3, ...) with only the edited properties changed. Claude can also render frames to check its work. Requires After Effects running on this Mac with Preferences > Scripting & Expressions > 'Allow Scripts to Write Files and Access Network' turned on.",
   "author": {

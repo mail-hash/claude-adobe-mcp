@@ -325,6 +325,45 @@ RT.TEXT_FIELDS = [
     "fauxBold", "fauxItalic", "allCaps", "smallCaps", "superscript", "subscript", "tsume", "boxTextSize"
 ];
 
+// Per-character styling: runs of characters whose style differs (AE 24+ characterRange). Only emitted when the
+// text has more than one run. Fields are the ones AE lets a range change.
+RT.RUN_FIELDS = ["font", "fontSize", "applyFill", "fillColor", "applyStroke", "strokeColor", "strokeWidth", "tracking", "baselineShift", "fauxBold", "fauxItalic", "allCaps", "smallCaps", "superscript", "subscript"];
+RT.serTextRuns = function (td) {
+    var runs = [], n = 0;
+    try { n = String(td.text).length; } catch (e) { return runs; }
+    if (n < 2 || n > 5000 || typeof td.characterRange !== "function") return runs;
+    var cur = null;
+    for (var i = 0; i < n; i++) {
+        var r, snap = {}, key = "";
+        try { r = td.characterRange(i, i + 1); } catch (e2) { return []; }
+        for (var f = 0; f < RT.RUN_FIELDS.length; f++) {
+            var name = RT.RUN_FIELDS[f], v;
+            try { v = r[name]; } catch (e3) { continue; }
+            if (v === undefined) continue;
+            if (name === "fillColor" && snap.applyFill === false) continue;
+            if ((name === "strokeColor" || name === "strokeWidth") && snap.applyStroke !== true) continue;
+            snap[name] = RT.roundAll(v);
+            key += name + "=" + RT.stringify(snap[name]) + ";";
+        }
+        if (cur && cur.key === key) { cur.end = i + 1; continue; }
+        cur = { key: key, start: i, end: i + 1 };
+        for (var k in snap) if (RT.has(snap, k)) cur[k] = snap[k];
+        runs.push(cur);
+    }
+    for (var j = 0; j < runs.length; j++) delete runs[j].key;
+    return runs.length > 1 ? runs : [];
+};
+RT.applyTextRuns = function (td, runs) {
+    if (!runs || !runs.length || typeof td.characterRange !== "function") return;
+    var n = String(td.text).length;
+    for (var i = 0; i < runs.length; i++) {
+        var o = runs[i], s = Math.max(0, Number(o.start) || 0), e = Math.min(n, Number(o.end) || 0);
+        if (e <= s) continue;
+        var r; try { r = td.characterRange(s, e); } catch (e1) { continue; }
+        for (var f = 0; f < RT.RUN_FIELDS.length; f++) { var name = RT.RUN_FIELDS[f]; if (!RT.has(o, name)) continue; try { r[name] = o[name]; } catch (e2) {} }
+    }
+};
+
 RT.serTextDoc = function (td) {
     var o = { text: td.text };
     try { o.boxText = td.boxText; } catch (e) {}
@@ -341,6 +380,8 @@ RT.serTextDoc = function (td) {
             o[f] = RT.roundAll(v);
         } catch (e) {}
     }
+    var runs = RT.serTextRuns(td);
+    if (runs.length) o.runs = runs;
     return o;
 };
 
@@ -353,6 +394,7 @@ RT.applyTextDoc = function (td, o) {
             td[f] = (f === "justification") ? RT.enumVal(ParagraphJustification, o[f]) : o[f];
         } catch (e) {}
     }
+    if (RT.has(o, "runs")) RT.applyTextRuns(td, o.runs);   // after the base style: ranges override it
     return td;
 };
 
@@ -609,6 +651,10 @@ RT.applyGroupAttrs = function (g, o, warn) {
         var n = names[i];
         if (!RT.has(o, n)) continue;
         if (n !== "enabled" && !g.isMask) continue;
+        if (n === "enabled" && !g.canSetEnabled && (g.matchName === "ADBE Layer Styles" || RT.isLayerStyleChild(g, g.parentProperty))) {
+            var L = RT.layerOf(g);
+            if (!L || !RT.ensureLayerStyles(L)) { warn(g.name + ": layer style could not be created (Layer Styles > Show All failed)"); continue; }
+        }
         try {
             g[n] = RT.MASK_ATTRS[n] ? RT.enumVal(RT.MASK_ATTRS[n], o[n]) : o[n];
         } catch (e) { warn(g.name + "." + n + ": " + e.message); }
@@ -638,8 +684,29 @@ RT.serChildren = function (g) {
     return out;
 };
 
+// Layer styles exist on every layer as hidden placeholders (canSetEnabled false) until one is added.
+RT.isLayerStyleChild = function (g, parent) { try { return !!parent && parent.matchName === "ADBE Layer Styles"; } catch (e) { return false; } };
+RT.layerOf = function (p) { try { return p.propertyGroup(p.propertyDepth); } catch (e) { return null; } };
+// Make a layer's styles editable: Layer > Layer Styles > Show All (menu command; no scripting API adds a style).
+RT.ensureLayerStyles = function (L) {
+    var ls = null; try { ls = L.property("ADBE Layer Styles"); } catch (e) { return false; }
+    if (!ls) return false;
+    var any = false; for (var i = 1; i <= ls.numProperties; i++) { try { if (ls.property(i).matchName !== "ADBE Blend Options Group" && ls.property(i).canSetEnabled) any = true; } catch (e2) {} }
+    if (any) return true;
+    var comp = L.containingComp;
+    try { for (var j = 1; j <= comp.numLayers; j++) comp.layer(j).selected = false; } catch (e3) {}
+    L.selected = true;
+    var id = 0; try { id = app.findMenuCommandId("Show All"); } catch (e4) {}
+    try { comp.openInViewer(); } catch (e5) {}   // the menu command only acts on the comp open in the viewer
+    try { app.executeCommand(id || 3743); } catch (e6) { return false; }
+    L.selected = false;
+    for (var k = 1; k <= ls.numProperties; k++) { try { if (ls.property(k).canSetEnabled && ls.property(k).matchName !== "ADBE Blend Options Group") return true; } catch (e7) {} }
+    return false;
+};
+
 RT.serGroup = function (g, parent) {
     if (RT.SKIP_GROUPS[g.matchName]) return null;
+    if (RT.isLayerStyleChild(g, parent)) { var settable = false; try { settable = g.canSetEnabled; } catch (e0) {} if (!settable) return null; }
     var indexedChild = parent && parent.propertyType === PropertyType.INDEXED_GROUP;
     var kids = RT.serChildren(g);
     if (!kids.length && !indexedChild) return null;

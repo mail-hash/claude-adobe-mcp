@@ -58,6 +58,8 @@ python3 tools/rtdiff.py before.json after.json
 - The change log only lists edits AE accepted. Rejected values (out of range, for example) appear under Warnings instead.
 - When you change a value on a **linear** key, AE recalculates the speed of the eases around it. A diff will show those speeds changing too.
 
-- Layer styles, puppet pins and Essential Graphics overrides aren't recreated by Rebuild; Apply can only patch layer styles that already exist. Per-character text styling isn't exported.
+- Per-character text styling is exported as `runs` on the text document (`[{start, end, font, fontSize, fillColor, …}]`, only when the text has more than one style) and applied back with `characterRange` (AE 24+).
+- Layer styles round-trip: inactive styles (hidden placeholders) are skipped on export; Rebuild and Apply create a style by running *Layer › Layer Styles › Show All* on the layer (the only way to add one by script; needs the comp open in the viewer, which the scripts do) and then set `enabled` and the values.
+- Puppet pins and Essential Graphics overrides aren't recreated by Rebuild.
 - Values are rounded to 6 decimal places. Key times are exact.
 - Effect layer pickers store a layer index, not an ID.

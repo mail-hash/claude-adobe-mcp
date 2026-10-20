@@ -91,6 +91,27 @@ try {
   const outline = await step("ae_get_comp", async () => { const r = await tool("ae_get_comp", { comp_id: compId }); assert(/export_id: /.test(r) && /L-/.test(r), "outline"); return /export_id: (\S+)/.exec(r)[1]; });
   await step("ae_get_layers summary", async () => { const r = await tool("ae_get_layers", { export_id: outline, summary: true }); const badge = r.layers.find((l) => l.name === "Badge"); assert(badge.animated.some((a) => /Position/.test(a.property) && a.keys.length === 2 && a.keys[1].frames === 60 && a.keys[1].timecode === "00:00:02:00"), "animated keys with timecode " + JSON.stringify(badge.animated)); assert(r.layers.find((l) => l.name === "Title").text.font === "Helvetica-Bold", "text font in summary"); return badge.animated.map((a) => a.property); });
   await step("ae_get_layers full", async () => { const r = await tool("ae_get_layers", { export_id: outline, layers: ["Badge"], paths: ["ADBE Transform Group/ADBE Position"] }); const keys = r.layers[0].props["ADBE Transform Group/ADBE Position"].keys; assert(keys.length === 2 && keys[0].outInterp === "bezier" && Math.abs(keys[0].outEase[0].influence - 75) < 0.01, "eased keys exported " + JSON.stringify(keys[0])); return keys[0].outEase; });
+  await step("text style runs + layer style survive export → rebuild", async () => {
+    const built = await tool("ae_run_script", { code: `var c = ensureComp("Selftest Styled", 640, 360, 2, 30); var L = c.layers.addText("Hello styled world"); var p = L.property("ADBE Text Properties").property("ADBE Text Document"); var td = p.value; td.fontSize = 48; var r = td.characterRange(0, 5); r.fontSize = 72; r.fillColor = [1, 0, 0]; p.setValue(td); c.openInViewer(); for (var i = 1; i <= c.numLayers; i++) c.layer(i).selected = false; L.selected = true; app.executeCommand(app.findMenuCommandId("Show All") || 3743); var ds = L.property("ADBE Layer Styles").property("dropShadow/enabled"); ds.enabled = true; ds.property("dropShadow/distance").setValue(25); ds.property("dropShadow/color").setValue([0, 0, 1, 1]); c.id` });
+    assert(built.ok, "styled comp built: " + JSON.stringify(built).slice(0, 300));
+    const ex = /export_id: (\S+)/.exec(await tool("ae_get_comp", { comp_id: built.result }))[1];
+    const full = await tool("ae_get_layers", { export_id: ex });
+    const walk = (nodes, segs) => { let cur = nodes; for (const mn of segs) { const n = (cur || []).find((x) => x.mn === mn); if (!n) return null; cur = n.props ?? n; } return cur; };   // full export: props is a tree of {mn, props|value}
+    const tdNode = walk(full.layers[0].props, ["ADBE Text Properties", "ADBE Text Document"]), td = tdNode && tdNode.value;
+    assert(td && td.runs && td.runs.length === 2 && td.runs[0].end === 5 && td.runs[0].fontSize === 72 && td.runs[1].fontSize === 48, "two runs exported: " + JSON.stringify(td && td.runs));
+    const shadow = walk(full.layers[0].props, ["ADBE Layer Styles", "dropShadow/enabled"]);
+    const dist = shadow && (Array.isArray(shadow) ? shadow : shadow.props || []).find((x) => x.mn === "dropShadow/distance");
+    assert(dist && dist.value === 25, "drop shadow exported with distance 25: " + JSON.stringify(shadow).slice(0, 200));
+    const rb = await tool("ae_rebuild_comp", { export_id: ex });
+    assert(rb.newCompId && !(rb.warnings || []).some((w) => /Layer Styles|canSetEnabled/.test(w)), "rebuilt without layer-style warnings: " + JSON.stringify(rb.warnings));
+    const check = await tool("ae_run_script", { code: `var c = findComp("Selftest Styled (rebuilt)"); var L = c.layer(1); var td = L.property("ADBE Text Properties").property("ADBE Text Document").value; var r0 = td.characterRange(0, 5), r1 = td.characterRange(5, 18); var ds = L.property("ADBE Layer Styles").property("dropShadow/enabled"); ({ run0: [r0.fontSize, r0.fillColor], run1: [r1.fontSize, r1.fillColor], shadow: ds.enabled, distance: ds.property("dropShadow/distance").value, color: ds.property("dropShadow/color").value })` });
+    const r = check.result;
+    assert(r.run0[0] === 72 && r.run0[1][0] === 1 && r.run1[0] === 48, "runs rebuilt: " + JSON.stringify(r));
+    assert(r.shadow === true && r.distance === 25 && r.color[2] === 1, "drop shadow rebuilt: " + JSON.stringify(r));
+    await tool("ae_remove_versions", { comp_ids: [rb.newCompId] });
+    await tool("ae_run_script", { code: `findComp("Selftest Styled").remove(); "ok"` });
+    return { runs: td.runs.map((x) => [x.start, x.end, x.fontSize]), shadow: [r.distance, r.color] };
+  });
   await step("ae_apply_edits dry_run", async () => { const r = await tool("ae_apply_edits", { export_id: outline, dry_run: true, edits: [{ op: "set_key", layer: "Badge", path: "ADBE Transform Group/ADBE Position", time: 2, value: [400, 180] }] }); assert(/dry run/.test(r), "dry"); return "ok"; });
   const applied = await step("ae_apply_edits", async () => { const r = await tool("ae_apply_edits", { export_id: outline, edits: [{ op: "set_key", layer: "Badge", path: "ADBE Transform Group/ADBE Position", time: 2, value: [400, 180] }, { op: "set_layer", layer: "Title", attrs: { name: "Title v2" } }] }); const id = Number(/comp id (\d+)/.exec(r)[1]); assert(id && /Title v2/.test(r), "v2 created"); return { v2: id, created: [...r.matchAll(/Created comps: ([\d, ]+)/g)].map((m) => m[1])[0] }; });
   const v2 = applied.v2;

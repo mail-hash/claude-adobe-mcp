@@ -15,7 +15,7 @@ Lets a Claude Desktop chat read, edit, build, render and check the comps open in
 node test/selftest.mjs      # --no-render skips the render steps, --keep leaves the scratch project open
 ```
 
-Drives the real MCP server against your running After Effects and exercises **every tool** (27/27): a new project, a comp built through `ae_run_script` with the helper library (groups in order, eased 2D/1D/colour keys), fonts list + replace, presets (list, apply, ambiguous-name refusal), expression lint (scratch, invalid with line, real property restored / applied), export / audit / edit / new version, inline and saved frames with a contact sheet, a waited render, a background batch render job, `ae_compare` against the render, import, rebuild, version cleanup, save/save-as/open, and a real modal dialog that `ae_status` detects and `ae_dismiss_dialog` clicks away. Scratch files land in `~/Library/Application Support/AE Claude Round Trip/selftest/`. It leaves AE on a blank project.
+Drives the real MCP server against your running After Effects and exercises **every tool** (27/27): a new project, a comp built through `ae_run_script` with the helper library (groups in order, eased 2D/1D/colour keys), fonts list + replace, presets (list, apply, ambiguous-name refusal), expression lint (scratch, invalid with line, real property restored / applied), per-character text runs and a drop-shadow layer style through export → rebuild, export / audit / edit / new version, inline and saved frames with a contact sheet, a waited render, a background batch render job, `ae_compare` against the render, import, rebuild, version cleanup, save/save-as/open, and a real modal dialog that `ae_status` detects and `ae_dismiss_dialog` clicks away. Scratch files land in `~/Library/Application Support/AE Claude Round Trip/selftest/`. It leaves AE on a blank project.
 
 ## Tools
 
@@ -73,7 +73,7 @@ All ExtendScript helpers are function-scoped (`#include` inside each script's II
 
 - Claude **desktop** app only, on the Mac running After Effects.
 - AE must be idle: a running render or script blocks other calls (they wait in the queue); `ae_status` reports `busy` while a job runs.
-- Round-trip format limits (`../AE Round Trip/README.md`): layer styles and puppet pins can't be created; text styling is per layer; AE won't set hidden properties.
+- Round-trip format limits (`../AE Round Trip/README.md`): puppet pins can't be created; AE won't set hidden properties. Per-character text styling (`runs`) and layer styles do round-trip (styles are created through *Layer Styles › Show All*, which needs the comp open in the viewer).
 - `ae_compare` and contact sheets need `ffmpeg` (Homebrew).
 
 ## Develop

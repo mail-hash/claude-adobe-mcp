@@ -4,7 +4,7 @@
    Times: Premiere ticks are 254016000000 per second. All results carry seconds and frames. */
 // $.evalFile from inside a function would make a plain `var` local to that function; bind the namespace explicitly.
 $.global.CPB = (function () {
-    var C = { VERSION: "1.3.0" };
+    var C = { VERSION: "1.4.0" };
     var TICKS = 254016000000;
 
     // ---------------------------------------------------------------- JSON (own, prototype-free)
@@ -1159,6 +1159,22 @@ $.global.CPB = (function () {
         var out = { from: timeInfo(from, seq), to: timeInfo(to, seq), shift: timeInfo(shift, seq), clipsMoved: moved, end: timeInfo(seq.end, seq) };
         if (blocked.length) out.notMoved = blocked;
         return out;
+    };
+
+    // ---------------------------------------------------------------- auto reframe (new sequence with a different aspect ratio)
+    C.autoReframe = function (a) {
+        var p = requireProject(), seq = findSequence(a.sequence);
+        var num = Number(a.aspectWidth) || 9, den = Number(a.aspectHeight) || 16;
+        var preset = a.motion === "slower" || a.motion === "faster" ? a.motion : "default";
+        var name = a.name ? String(a.name) : seq.name + " " + num + "x" + den;
+        if (seqNamed(name)) fail("A sequence named '" + name + "' already exists.");
+        if (a.dryRun) return { dryRun: true, plan: { action: "autoReframe", source: seq.name, aspect: num + ":" + den, motion: preset, name: name } };
+        var before = {}; for (var i = 0; i < p.sequences.numSequences; i++) before[p.sequences[i].sequenceID] = true;
+        var r = null; try { r = seq.autoReframeSequence(num, den, preset, name, !!a.nest); } catch (e) { fail("autoReframeSequence failed: " + e.message); }
+        var created = null; for (var j = 0; j < p.sequences.numSequences; j++) if (!before[p.sequences[j].sequenceID]) created = p.sequences[j];
+        if (!created) fail("Premiere did not create the reframed sequence");
+        var st = created.getSettings();
+        return { sequence: seqSummary(created), size: [st.videoFrameWidth, st.videoFrameHeight], source: { id: seq.sequenceID, name: seq.name }, note: "Auto Reframe analyses motion; the Program Monitor shows the result. The new sequence is a copy; the source is unchanged." };
     };
 
     // ---------------------------------------------------------------- stills & render

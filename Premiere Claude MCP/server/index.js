@@ -38,10 +38,12 @@ settable through Premiere 26.5's API.
 Transcript: pr_transcribe (local mlx_whisper, word timings) then pr_cut_by_transcript (fillers / words / phrases / ranges, razor + remove +
 close gaps). Audio: pr_analyze_audio (LUFS, peaks, silences), pr_set_clip_volume (dB, keyframes), pr_duck_audio. Graphics:
 pr_list_mogrts / pr_add_graphic / pr_get_graphic_text / pr_set_graphic_text.
+Colour: pr_color_correct (Lumetri controls by name), pr_measure_color, pr_match_color. Delivery: pr_export_recipe (youtube_4k, vertical_9x16 with
+Auto Reframe, prores_master, podcast_mp3…, verified with ffprobe). Start from footage: pr_rough_cut (folder → import, shots, assembly, markers).
 pr_run_script runs raw ExtendScript with helpers: getProject(nameOrPath), getSequence(project, nameOrId), findItem(ref),
 findBin(path, create), qeSequence(seq), makeTime(sec), timeInfo(t, seq), log(...) (collected into "output").`;
 
-const server = new McpServer({ name: "premiere-bridge", version: "1.4.0" }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: "premiere-bridge", version: "1.5.0" }, { instructions: INSTRUCTIONS });
 const text = (s) => ({ content: [{ type: "text", text: typeof s === "string" ? s : JSON.stringify(s, null, 1) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: String(e?.message ?? e) + (e?.detail ? "\n" + JSON.stringify(e.detail, null, 1) : "") }] });
 const tool = (name, def, fn) => server.registerTool(name, def, async (args) => { try { return await fn(args); } catch (e) { return fail(e); } });
@@ -585,6 +587,205 @@ tool("pr_set_graphic_text", {
   description: "Change the text of a graphic clip: target is a MOGRT parameter name (e.g. 'Title'), 'text-layer:N' for a native text layer, or omitted for the first text. font (PostScript name) and font_size apply to MOGRT parameters that allow it.",
   inputSchema: { ...ClipRef, text: z.string(), target: z.union([z.string(), z.number().int()]).optional(), font: z.string().optional(), font_size: z.number().optional(), dry_run: DryRun },
 }, async (a) => text(await call("setGraphicText", { ...clipRefArgs(a), text: a.text, target: a.target, font: a.font, fontSize: a.font_size, dryRun: a.dry_run }, { timeoutMs: 60000 })));
+
+// ------------------------------------------------------------------ colour (Lumetri), export recipes, rough cut
+// Lumetri Color property names repeat across sections, so each control is found as the first property with that
+// name after its section header ("Basic Correction", "Creative", "Vignette").
+const LUMETRI = {
+  temperature: ["Basic Correction", "Temperature"], tint: ["Basic Correction", "Tint"], saturation: ["Basic Correction", "Saturation"],
+  exposure: ["Basic Correction", "Exposure"], contrast: ["Basic Correction", "Contrast"], highlights: ["Basic Correction", "Highlights"],
+  shadows: ["Basic Correction", "Shadows"], whites: ["Basic Correction", "Whites"], blacks: ["Basic Correction", "Blacks"],
+  vibrance: ["Creative", "Vibrance"], creative_saturation: ["Creative", "Saturation"], faded_film: ["Creative", "Faded Film"], sharpen: ["Creative", "Sharpen"], look_intensity: ["Creative", "Intensity"],
+  vignette_amount: ["Vignette", "Amount"], vignette_midpoint: ["Vignette", "Midpoint"], vignette_roundness: ["Vignette", "Roundness"], vignette_feather: ["Vignette", "Feather"],
+};
+const LUMETRI_DEFAULTS = { temperature: 0, tint: 0, saturation: 100, exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0, vibrance: 0, creative_saturation: 100, faded_film: 0, sharpen: 0, look_intensity: 100, vignette_amount: 0, vignette_midpoint: 50, vignette_roundness: 0, vignette_feather: 50 };
+async function lumetriOf(ref, { create } = {}) {
+  let fx = await call("getClipEffects", { ...ref, keys: false }, { timeoutMs: 60000 });
+  let lum = fx.components.find((c) => c.name === "Lumetri Color");
+  if (!lum && create) { await call("addEffect", { ...ref, effect: "Lumetri Color" }, { timeoutMs: 60000 }); fx = await call("getClipEffects", { ...ref, keys: false }, { timeoutMs: 60000 }); lum = fx.components.find((c) => c.name === "Lumetri Color"); }
+  if (!lum) return { clip: fx.clip, lumetri: null, map: null };
+  const map = {};
+  for (const [key, [section, name]] of Object.entries(LUMETRI)) {
+    const s = lum.properties.findIndex((p) => p.name === section); if (s < 0) continue;
+    const next = lum.properties.findIndex((p, i) => i > s && ["Basic Correction", "Creative", "Curves", "Color Wheels & Match", "HSL Secondary", "Vignette", "SpeedGrade Custom"].includes(p.name));
+    const idx = lum.properties.findIndex((p, i) => i > s && (next < 0 || i < next) && p.name === name);
+    if (idx >= 0) map[key] = { index: idx, value: lum.properties[idx].value };
+  }
+  return { clip: fx.clip, lumetri: lum, map };
+}
+const ColorControls = { exposure: z.number().optional().describe("stops, about -5..5"), contrast: z.number().optional().describe("-100..100"), highlights: z.number().optional(), shadows: z.number().optional(), whites: z.number().optional(), blacks: z.number().optional(), temperature: z.number().optional().describe("-100 (blue) .. 100 (warm)"), tint: z.number().optional().describe("-100 (green) .. 100 (magenta)"), saturation: z.number().optional().describe("0..200, 100 = unchanged"), vibrance: z.number().optional(), creative_saturation: z.number().optional(), faded_film: z.number().optional(), sharpen: z.number().optional(), look_intensity: z.number().optional(), vignette_amount: z.number().optional().describe("-5..5"), vignette_midpoint: z.number().optional(), vignette_roundness: z.number().optional(), vignette_feather: z.number().optional() };
+
+tool("pr_color_correct", {
+  title: "Colour correct (Lumetri)",
+  description: "Set Lumetri Color basic correction / creative / vignette controls on a clip by name (exposure, contrast, highlights, shadows, whites, blacks, temperature, tint, saturation, vibrance, sharpen, faded_film, vignette_*). Adds Lumetri Color if the clip has none. reset: true puts every control back to its default first. Returns the current values. Use pr_measure_color / pr_export_frame to judge the result.",
+  inputSchema: { ...ClipRef, ...ColorControls, reset: z.boolean().optional(), dry_run: DryRun },
+}, async (a) => {
+  const ref = clipRefArgs(a);
+  const wanted = Object.fromEntries(Object.keys(LUMETRI).filter((k) => a[k] !== undefined && a[k] !== null).map((k) => [k, a[k]]));
+  if (a.reset) for (const k of Object.keys(LUMETRI)) if (wanted[k] === undefined) wanted[k] = LUMETRI_DEFAULTS[k];
+  if (!Object.keys(wanted).length) throw new Error("give at least one control (exposure, temperature, …) or reset: true");
+  if (a.dry_run) { const cur = await lumetriOf(ref); return text({ dryRun: true, clip: cur.clip.name, hasLumetri: !!cur.lumetri, set: wanted }); }
+  const { clip, map } = await lumetriOf(ref, { create: true });
+  const set = {};
+  for (const [k, v] of Object.entries(wanted)) { if (!map[k]) { set[k] = "not found in this Lumetri version"; continue; } const r = await call("setEffectProperty", { ...ref, component: "Lumetri Color", property: map[k].index, value: v }, { timeoutMs: 60000 }); set[k] = r.property.value; }
+  const after = await lumetriOf(ref);
+  return text({ clip: clip.name, set, values: Object.fromEntries(Object.entries(after.map).map(([k, v]) => [k, v.value])) });
+});
+
+async function frameStats(png) {
+  const ff = await ffmpegPath(); if (!ff) throw new Error("ffmpeg not found");
+  const r = await run(ff, ["-hide_banner", "-i", png, "-vf", "signalstats,metadata=print:file=-", "-f", "null", "-"], { timeout: 60000, maxBuffer: 16 * 1024 * 1024 });
+  const get = (k) => { const m = new RegExp(`lavfi\\.signalstats\\.${k}=([-\\d.]+)`).exec(r.stdout + r.stderr); return m ? Number(m[1]) : null; };
+  const rgb = await run(ff, ["-loglevel", "error", "-i", png, "-vf", "scale=1:1:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], { timeout: 60000, encoding: "buffer" });
+  const [R, G, B] = rgb.stdout;
+  return { rgb: [R, G, B], luma: { avg: get("YAVG"), min: get("YMIN"), max: get("YMAX"), low: get("YLOW"), high: get("YHIGH") }, saturation: { avg: get("SATAVG"), max: get("SATMAX") }, hue: get("HUEAVG") };
+}
+function avgStats(list) { const n = list.length || 1, s = (f) => list.reduce((t, x) => t + (f(x) || 0), 0) / n; return { rgb: [s((x) => x.rgb[0]), s((x) => x.rgb[1]), s((x) => x.rgb[2])].map((v) => +v.toFixed(1)), lumaAvg: +s((x) => x.luma.avg).toFixed(1), lumaLow: +s((x) => x.luma.low).toFixed(1), lumaHigh: +s((x) => x.luma.high).toFixed(1), saturationAvg: +s((x) => x.saturation.avg).toFixed(1), hueAvg: +s((x) => x.hue).toFixed(1) }; }
+async function measureClip(seqId, trackIndex, clipIndex, count, project) {
+  const g = await call("getSequence", { sequence: seqId, project }, { timeoutMs: 120000 });
+  const fps = g.fps || 30, track = g.tracks.find((t) => t.type === "video" && t.index === trackIndex); if (!track) throw new Error(`video track ${trackIndex} not found`);
+  const clip = track.clips[clipIndex]; if (!clip) throw new Error(`clip ${clipIndex} not found on video ${trackIndex}`);
+  const frames = []; const n = Math.max(1, count || 3); for (let i = 0; i < n; i++) frames.push(Math.round((clip.start.seconds + (clip.end.seconds - clip.start.seconds) * (i + 1) / (n + 1)) * fps));
+  const dir = path.join(SUPPORT_DIR, "color", `${Date.now()}-${trackIndex}-${clipIndex}`); await fs.mkdir(dir, { recursive: true });
+  const stats = [];
+  for (const f of frames) { const r = await call("exportFrame", { sequence: seqId, frame: f, path: path.join(dir, `f${f}.png`), project }, { timeoutMs: 120000 }); stats.push({ frame: f, timecode: tcOf(f / fps, fps), ...(await frameStats(r.path || path.join(dir, `f${f}.png`))) }); }
+  return { clip: { name: clip.name, index: clipIndex, track: `video ${trackIndex}`, start: clip.start, end: clip.end }, fps, frames: stats, average: avgStats(stats) };
+}
+
+tool("pr_measure_color", {
+  title: "Measure colour",
+  description: "Colour statistics of a clip (frames sampled evenly, default 3) or of given frames: mean RGB, luma average/low/high (0-255, from ffmpeg signalstats), saturation, hue. For judging grades and for pr_match_color.",
+  inputSchema: { sequence: Seq, track_index: z.number().int().optional(), clip_index: z.number().int().optional(), frames: z.array(z.number()).optional().describe("explicit sequence frames instead of a clip"), samples: z.number().int().optional(), project: Project },
+  annotations: { readOnlyHint: true },
+}, async (a) => {
+  const g = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 });
+  if (a.frames?.length) { const dir = path.join(SUPPORT_DIR, "color", String(Date.now())); await fs.mkdir(dir, { recursive: true }); const stats = []; for (const f of a.frames) { const r = await call("exportFrame", { sequence: g.id, frame: f, path: path.join(dir, `f${f}.png`), project: a.project }, { timeoutMs: 120000 }); stats.push({ frame: f, timecode: tcOf(f / (g.fps || 30), g.fps || 30), ...(await frameStats(r.path || path.join(dir, `f${f}.png`))) }); } return text({ sequence: g.name, frames: stats, average: avgStats(stats) }); }
+  if (a.clip_index === undefined) throw new Error("give clip_index (and track_index) or frames");
+  return text({ sequence: g.name, ...(await measureClip(g.id, a.track_index ?? 0, a.clip_index, a.samples, a.project)) });
+});
+
+tool("pr_match_color", {
+  title: "Match colour to a reference clip",
+  description: "Make a target clip look like a reference clip: measures both (luma, R/B balance, G balance, saturation), estimates Lumetri exposure, temperature, tint and saturation for the target, applies them, re-measures and refines once (iterations, default 2). Returns before/after measurements and the controls set. dry_run only measures and proposes.",
+  inputSchema: { sequence: Seq, reference_track_index: z.number().int().optional(), reference_clip_index: z.number().int(), target_track_index: z.number().int().optional(), target_clip_index: z.number().int(), iterations: z.number().int().optional(), match: z.array(z.enum(["exposure", "temperature", "tint", "saturation"])).optional(), samples: z.number().int().optional(), project: Project, dry_run: DryRun },
+}, async (a) => {
+  const g = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 });
+  const rt = a.reference_track_index ?? 0, tt = a.target_track_index ?? 0, want = new Set(a.match || ["exposure", "temperature", "tint", "saturation"]);
+  const ref = await measureClip(g.id, rt, a.reference_clip_index, a.samples, a.project);
+  let tgt = await measureClip(g.id, tt, a.target_clip_index, a.samples, a.project);
+  const targetRef = { sequence: g.id, trackType: "video", trackIndex: tt, clipIndex: a.target_clip_index, project: a.project };
+  const log2 = (x) => Math.log(x) / Math.LN2, clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const estimate = (r, t, cur) => {
+    const e = {};
+    if (want.has("exposure")) e.exposure = clamp((cur.exposure || 0) + log2(Math.max(1, r.lumaAvg) / Math.max(1, t.lumaAvg)) * 0.9, -5, 5);
+    if (want.has("temperature")) e.temperature = clamp((cur.temperature || 0) + log2((r.rgb[0] + 1) / (r.rgb[2] + 1)) * 45 - log2((t.rgb[0] + 1) / (t.rgb[2] + 1)) * 45, -100, 100);
+    if (want.has("tint")) e.tint = clamp((cur.tint || 0) - (log2((r.rgb[1] + 1) / ((r.rgb[0] + r.rgb[2]) / 2 + 1)) - log2((t.rgb[1] + 1) / ((t.rgb[0] + t.rgb[2]) / 2 + 1))) * 45, -100, 100);
+    if (want.has("saturation")) e.saturation = clamp((cur.saturation || 100) * (Math.max(1, r.saturationAvg) / Math.max(1, t.saturationAvg)), 0, 200);
+    return Object.fromEntries(Object.entries(e).map(([k, v]) => [k, +v.toFixed(2)]));
+  };
+  const first = estimate(ref.average, tgt.average, {});
+  if (a.dry_run) return text({ dryRun: true, reference: ref, target: tgt, proposed: first });
+  let cur = {}, history = [];
+  for (let i = 0; i < (a.iterations ?? 2); i++) {
+    const est = estimate(ref.average, tgt.average, cur);
+    const { map } = await lumetriOf(targetRef, { create: true });
+    for (const [k, v] of Object.entries(est)) if (map[k]) await call("setEffectProperty", { ...targetRef, component: "Lumetri Color", property: map[k].index, value: v }, { timeoutMs: 60000 });
+    cur = est; tgt = await measureClip(g.id, tt, a.target_clip_index, a.samples, a.project);
+    history.push({ iteration: i + 1, set: est, targetAfter: tgt.average });
+  }
+  return text({ reference: ref.average, targetBefore: history.length ? undefined : tgt.average, result: tgt.average, controls: cur, history, deltas: { luma: +(tgt.average.lumaAvg - ref.average.lumaAvg).toFixed(1), rgb: tgt.average.rgb.map((v, i) => +(v - ref.average.rgb[i]).toFixed(1)), saturation: +(tgt.average.saturationAvg - ref.average.saturationAvg).toFixed(1) } });
+});
+
+// ---- export recipes
+const RECIPES = {
+  youtube_4k: { preset: ["YouTube 2160p 4K"], describe: "H.264 3840x2160 for YouTube" },
+  youtube_1080: { preset: ["YouTube 1080p HD"], describe: "H.264 1920x1080 for YouTube" },
+  youtube_720: { preset: ["YouTube 720p HD"], describe: "H.264 1280x720" },
+  match_source: { preset: ["H264 Match Source - High bitrate", "Match Source - High bitrate"], describe: "H.264 at the sequence's size and rate" },
+  vertical_9x16: { reframe: [9, 16], preset: ["H264 Match Source - High bitrate", "Match Source - High bitrate"], describe: "Auto Reframe to 9:16, then H.264 match source" },
+  square_1x1: { reframe: [1, 1], preset: ["H264 Match Source - High bitrate", "Match Source - High bitrate"], describe: "Auto Reframe to 1:1, then H.264 match source" },
+  prores_master: { preset: ["Apple ProRes 422 HQ", "ProRes 422 HQ"], describe: "Apple ProRes 422 HQ master" },
+  podcast_mp3: { preset: ["MP3 192kbps High Quality", "MP3 192"], describe: "MP3 192 kbps audio only" },
+  wav: { preset: ["Waveform Audio 48kHz 16-bit", "Waveform Audio"], describe: "WAV 48 kHz 16-bit audio only" },
+};
+tool("pr_export_recipe", {
+  title: "Export with a named recipe",
+  description: `Deliverables in one call: recipe = ${Object.keys(RECIPES).join(" | ")} (list_recipes: true describes them). Vertical/square recipes first Auto Reframe the sequence into a new one. Renders in Premiere (direct mode, waits), then verifies the file with ffprobe (size, duration vs the sequence, codec) and reports mismatches. range: entire | inout.`,
+  inputSchema: { sequence: Seq, recipe: z.string().optional(), out_path: z.string().optional().describe("output file; default next to the project under exports/"), range: z.enum(["entire", "inout"]).optional(), motion: z.enum(["default", "slower", "faster"]).optional().describe("Auto Reframe motion preset"), list_recipes: z.boolean().optional(), project: Project, dry_run: DryRun },
+}, async (a) => {
+  if (a.list_recipes || !a.recipe) return text({ recipes: Object.fromEntries(Object.entries(RECIPES).map(([k, v]) => [k, v.describe + (v.reframe ? ` (reframe ${v.reframe.join(":")})` : "")])) });
+  const rc = RECIPES[a.recipe]; if (!rc) throw new Error(`unknown recipe '${a.recipe}'; use list_recipes: true`);
+  let presetPath = null; for (const frag of rc.preset) { const m = await findPresets(frag); const exact = m.filter((p) => path.basename(p, ".epr").toLowerCase() === frag.toLowerCase()); if (exact.length) { presetPath = exact[0]; break; } if (m.length === 1) { presetPath = m[0]; break; } }
+  if (!presetPath) throw new Error(`no export preset found for ${a.recipe} (tried ${rc.preset.join(", ")}); see pr_list_export_presets`);
+  const seq = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 });
+  const st = await call("status", {}, { timeoutMs: 20000 });
+  const projPath = st.activeProject?.path || os.homedir();
+  const ext = /mp3/i.test(presetPath) ? ".mp3" : /Waveform/i.test(presetPath) ? ".wav" : /ProRes/i.test(presetPath) ? ".mov" : ".mp4";
+  const out = a.out_path || path.join(path.dirname(projPath), "exports", `${seq.name.replace(/[^\w.-]+/g, "_")}-${a.recipe}${ext}`);
+  const plan = { recipe: a.recipe, describe: rc.describe, sequence: seq.name, reframe: rc.reframe ? rc.reframe.join(":") : null, preset: presetPath, out };
+  if (a.dry_run) return text({ dryRun: true, plan });
+  let renderSeq = seq.id, reframed = null;
+  if (rc.reframe) { const r = await call("autoReframe", { sequence: seq.id, aspectWidth: rc.reframe[0], aspectHeight: rc.reframe[1], motion: a.motion, name: `${seq.name} ${rc.reframe.join("x")}`, project: a.project }, { timeoutMs: 600000 }); renderSeq = r.sequence.id; reframed = r.sequence; }
+  await fs.mkdir(path.dirname(out), { recursive: true });
+  const t0 = Date.now();
+  const r = await call("render", { sequence: renderSeq, presetPath, path: out, mode: "direct", range: a.range || "entire", project: a.project }, { timeoutMs: 3600000 });
+  const file = r.path || out, stat = await fs.stat(file).catch(() => null);
+  if (!stat) throw new Error("render produced no file: " + JSON.stringify(r).slice(0, 300));
+  let probe = null; try { const pr = await run(await ffprobePath(), ["-v", "error", "-show_entries", "format=duration:stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels", "-of", "json", file], { timeout: 60000 }); probe = JSON.parse(pr.stdout); } catch {}
+  const v = probe?.streams?.find((s) => s.codec_type === "video"), au = probe?.streams?.find((s) => s.codec_type === "audio");
+  const duration = probe ? Number(probe.format.duration) : null, expected = (reframed || seq).end?.seconds;
+  const checks = [];
+  if (duration !== null && expected && Math.abs(duration - expected) > 0.5 && (a.range || "entire") === "entire") checks.push(`duration ${duration.toFixed(2)} s differs from the sequence (${expected.toFixed(2)} s)`);
+  if (rc.reframe && v && Math.abs(v.width / v.height - rc.reframe[0] / rc.reframe[1]) > 0.02) checks.push(`aspect ${v.width}x${v.height} is not ${rc.reframe.join(":")}`);
+  if (/youtube_4k/.test(a.recipe) && v && v.height < 2160) checks.push(`height ${v.height} < 2160`);
+  if (!v && !/mp3|wav/.test(a.recipe)) checks.push("no video stream");
+  return text({ recipe: a.recipe, out: file, bytes: stat.size, seconds: +((Date.now() - t0) / 1000).toFixed(1), reframedSequence: reframed, video: v ? { codec: v.codec_name, size: `${v.width}x${v.height}`, fps: v.r_frame_rate } : null, audio: au ? { codec: au.codec_name, sampleRate: au.sample_rate, channels: au.channels } : null, duration, expectedDuration: expected, verified: checks.length === 0, issues: checks.length ? checks : undefined });
+});
+
+// ---- media-first rough cut
+tool("pr_rough_cut", {
+  title: "Rough cut from a folder of clips",
+  description: `Media-first start: probe every video file in a folder (ffprobe: duration, fps, size), import them, optionally split each into shots (ffmpeg scene detection), then build a first assembly on a new sequence: the clips (or their first N shots) in filename order, each trimmed to take_seconds from the shot start (or whole), markers named after the files, and the proposal returned. dry_run returns the proposal without touching Premiere. Then refine with pr_review_sheet / pr_trim_clip / pr_cut_by_transcript.`,
+  inputSchema: { folder: z.string(), sequence: z.string().describe("name of the new sequence"), take_seconds: z.number().optional().describe("seconds to keep from each shot/clip (default: whole)"), detect_shots: z.boolean().optional(), shots_per_clip: z.number().int().optional().describe("with detect_shots: max shots per clip (default 3)"), scene_threshold: z.number().optional(), extensions: z.array(z.string()).optional(), limit: z.number().int().optional(), bin: z.string().optional(), project: Project, dry_run: DryRun },
+}, async (a) => {
+  const exts = new Set((a.extensions || ["mp4", "mov", "mxf", "m4v", "avi", "mts", "mkv", "braw", "r3d"]).map((e) => e.toLowerCase().replace(/^\./, "")));
+  const entries = (await fs.readdir(a.folder, { withFileTypes: true })).filter((e) => e.isFile() && exts.has(path.extname(e.name).slice(1).toLowerCase())).map((e) => path.join(a.folder, e.name)).sort((x, y) => x.localeCompare(y, undefined, { numeric: true }));
+  if (!entries.length) throw new Error(`no video files in ${a.folder}`);
+  const files = entries.slice(0, a.limit ?? 200), probe = await ffprobePath(), ff = await ffmpegPath();
+  const clips = [];
+  for (const f of files) {
+    let dur = null, fps = null, w = null, h = null;
+    try { const pr = await run(probe, ["-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height,r_frame_rate", "-of", "json", f], { timeout: 60000 }); const j = JSON.parse(pr.stdout); dur = Number(j.format.duration); const v = j.streams.find((s) => s.codec_type === "video"); if (v) { w = v.width; h = v.height; const [n, d] = String(v.r_frame_rate).split("/").map(Number); fps = n && d ? +(n / d).toFixed(3) : null; } } catch (e) { clips.push({ file: f, error: "ffprobe failed: " + e.message.split("\n")[0] }); continue; }
+    const rec = { file: f, name: path.basename(f), duration: dur, fps, size: w ? `${w}x${h}` : null, shots: [] };
+    if (a.detect_shots && ff) {
+      const r = await run(ff, ["-nostats", "-hide_banner", "-i", f, "-vf", `select='gt(scene,${a.scene_threshold ?? 0.3})',metadata=print`, "-an", "-f", "null", "-"], { timeout: 1800000, maxBuffer: 64 * 1024 * 1024 }).catch((e) => e);
+      const cuts = [...String(r.stderr || "").matchAll(/pts_time:([\d.]+)/g)].map((m) => Number(m[1])).filter((t) => t > 0.2);
+      const bounds = [0, ...cuts, dur].filter((t, i, arr) => i === 0 || t - arr[i - 1] > 0.3);
+      for (let i = 0; i < bounds.length - 1 && rec.shots.length < (a.shots_per_clip ?? 3); i++) rec.shots.push({ start: +bounds[i].toFixed(3), end: +bounds[i + 1].toFixed(3) });
+    }
+    if (!rec.shots.length) rec.shots.push({ start: 0, end: dur });
+    clips.push(rec);
+  }
+  const shots = [];
+  for (const c of clips) if (!c.error) for (const s of c.shots) { const len = s.end - s.start, take = a.take_seconds ? Math.min(a.take_seconds, len) : len; if (take <= 0) continue; shots.push({ path: c.file, name: `${c.name}${c.shots.length > 1 ? ` #${c.shots.indexOf(s) + 1}` : ""}`, in_seconds: s.start, duration_seconds: +take.toFixed(3) }); }
+  const total = shots.reduce((t, s) => t + s.duration_seconds, 0);
+  const proposal = { folder: a.folder, files: clips.length, shots: shots.length, totalSeconds: +total.toFixed(2), clips, edit: shots };
+  if (a.dry_run) return text({ dryRun: true, ...proposal });
+  const fps = clips.find((c) => c.fps)?.fps || 30;
+  const seqs = await call("listSequences", { project: a.project }, { timeoutMs: 60000 });
+  if (seqs.sequences.some((s) => s.name === a.sequence)) throw new Error(`sequence '${a.sequence}' already exists; pick another name`);
+  // import first (so durations and the first clip's settings are known), then lay out through the edit builder
+  const paths = [...new Set(shots.map((s) => s.path))];
+  const imp = await call("importFiles", { paths, bin: a.bin || "Rough cut", project: a.project }, { timeoutMs: 1800000 });
+  const edit = shots.map((s) => ({ path: s.path, name: s.name, in_seconds: s.in_seconds, duration_seconds: s.duration_seconds }));
+  const timelineClips = [];
+  let cursor = 0;
+  for (const s of edit) { const inF = Math.round(s.in_seconds * fps), durF = Math.max(1, Math.round(s.duration_seconds * fps)); timelineClips.push({ path: s.path, start_frame: cursor, in_frame: inF, out_frame: inF + durF }); s.start_frame = cursor; s.end_frame = cursor + durF; cursor += durF; }
+  const build = await buildFromTimeline({ timeline: { sequence: a.sequence, tracks: [{ type: "video", index: 0, clips: timelineClips }] }, bin: a.bin || "Rough cut", project: a.project, dry_run: false });
+  const markers = [];
+  for (const s of edit) { try { const m = await call("addMarker", { sequence: build.sequence.id, startFrame: s.start_frame, endFrame: s.end_frame, name: s.name, project: a.project }, { timeoutMs: 60000 }); markers.push(m.marker.start.timecode); } catch {} }
+  return text({ sequence: build.sequence, imported: imp.imported?.length ?? 0, offline: imp.offline?.length ? imp.offline : undefined, placed: build.placed.length, markers: markers.length, totalSeconds: +total.toFixed(2), fps, edit, warnings: build.warnings?.length ? build.warnings : undefined, next: "pr_review_sheet to look at it; pr_trim_clip / pr_move_clip / pr_remove_clips to refine; pr_transcribe + pr_cut_by_transcript for dialogue." });
+});
 
 // ------------------------------------------------------------------ build / compare
 function normName(s) { return String(s || "").replace(/\.[^.]+$/, "").toLowerCase(); }
