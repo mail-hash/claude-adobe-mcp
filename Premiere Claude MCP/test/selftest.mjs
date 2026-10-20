@@ -62,6 +62,20 @@ try {
   await run(FFMPEG, ["-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=6", "-f", "lavfi", "-i", "color=c=blue:s=320x180:r=30:d=6", "-filter_complex", "[0:a]volume=0.5[a]", "-map", "1:v", "-map", "[a]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", path.join(dir, "tone.mp4")]);
   tone = path.join(dir, "tone.mp4");
 } catch (e) { console.log("○ test media for audio/transcript steps not generated: " + e.message.split("\n")[0]); }
+// two-voice interview for pr_classify_speech: Daniel asks (3 questions), Samantha answers, 0.6 s of silence between turns, under a still
+let interview = null, interviewTurns = [];
+try {
+  const lines = [["Daniel", "So tell me, what first got you interested in climate risk?"], ["Samantha", "I started out in insurance, where every flood and every wildfire shows up as a claim. After a few years the pattern was impossible to ignore, so I moved into advising companies on how to measure it."], ["Daniel", "And how do boards usually react when you show them the numbers?"], ["Samantha", "Most of them are surprised. They expect a vague sustainability story and instead they get a balance sheet exposure. That changes the conversation very quickly."], ["Daniel", "What would you say to a company that is only just starting?"], ["Samantha", "Start with the assets you already own. Map them against the hazards, put a number on the worst year, and work backwards from there. It is less work than people fear."]];
+  const parts = [];
+  for (let i = 0; i < lines.length; i++) { const aiff = path.join(dir, `line${i}.aiff`), wav = path.join(dir, `line${i}.wav`); await run("/usr/bin/say", ["-v", lines[i][0], "-o", aiff, lines[i][1]]); await run(FFMPEG, ["-y", "-loglevel", "error", "-i", aiff, "-ac", "1", "-ar", "22050", wav]); parts.push(wav); }
+  const gap = path.join(dir, "gap.wav"); await run(FFMPEG, ["-y", "-loglevel", "error", "-f", "lavfi", "-t", "0.6", "-i", "anullsrc=r=22050:cl=mono", gap]);
+  const list = path.join(dir, "interview.txt"); await fs.writeFile(list, parts.map((p) => `file '${p}'`).join("\nfile '" + gap + "'\n") + "\n");
+  await run(FFMPEG, ["-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", list, "-c", "pcm_s16le", path.join(dir, "interview.wav")]);
+  let t = 0; for (let i = 0; i < parts.length; i++) { const d = Number((await run("/opt/homebrew/bin/ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", parts[i]])).stdout.trim()); interviewTurns.push({ from: t, to: t + d, voice: lines[i][0] }); t += d + 0.6; }
+  await run(FFMPEG, ["-y", "-loglevel", "error", "-i", path.join(dir, "interview.wav"), "-f", "lavfi", "-i", "color=c=0x335577:s=640x360:r=30", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", path.join(dir, "interview.mp4")]);
+  interview = path.join(dir, "interview.mp4");
+} catch (e) { console.log("○ interview clip for pr_classify_speech not generated: " + e.message.split("\n")[0]); }
+const talkingHead = path.join(os.homedir(), "Documents", "01 What are ESG Risks.mp4");   // real single-speaker footage, used read-only for the gaze check when present
 
 try {
   const st = await step("pr_status", () => tool("pr_status"));
@@ -162,6 +176,58 @@ try {
     });
     await step("pr_suggest_broll (moments, candidates, markers)", async () => { const folder = path.join(dir, "broll"); await fs.mkdir(folder, { recursive: true }); for (const f of ["parking lot wide.mp4", "city street.mp4"]) await fs.writeFile(path.join(folder, f), ""); const tx4 = await tool("pr_transcribe", { sequence: txSeq, language: "en", project: projA }); const r = await tool("pr_suggest_broll", { sequence: txSeq, transcript: tx4.transcript, min_seconds: 3, keywords: ["parking"], candidates_folder: folder, add_markers: true, project: projA }); assert(r.count >= 1 && r.moments.some((m) => /parking/.test(m.reason) && m.candidates && m.candidates[0].file.endsWith("parking lot wide.mp4")), "parking moment with a matching candidate: " + JSON.stringify(r.moments)); const m = await tool("pr_list_markers", { sequence: txSeq, filter: "B-roll", project: projA }); assert(m.markers.length === r.markers, "markers added"); await tool("pr_remove_markers", { sequence: txSeq, all: true, project: projA }); return r.moments.map((x) => [x.start.timecode, x.reason]); });
     await step("pr_remove_sequence speech version", () => tool("pr_remove_sequence", { sequence: txSeq, project: projA }));
+  }
+  if (interview) {
+    const ivItem = await step("import interview.mp4", async () => { const r = await tool("pr_import_files", { paths: [interview], bin: "Selftest", project: projA }); return (r.imported[0] || r.alreadyInProject[0]).id; });
+    const ivSeq = await step("sequence from interview.mp4", async () => { const c = await tool("pr_create_sequence", { name: "Selftest interview v2", from_item: ivItem, project: projA }); await tool("pr_place_clip", { sequence: c.id, item: ivItem, start_frame: 0, project: projA }); return c.id; });
+    const ivTx = await step("pr_transcribe interview (sequence)", async () => { const r = await tool("pr_transcribe", { sequence: ivSeq, language: "en", project: projA }); assert(r.mode === "sequence" && r.wordCount > 100 && /insurance/i.test(r.text), "interview transcribed: " + r.text.slice(0, 80)); return r.transcript; }, { optional: true });
+    const cls = ivTx && await step("pr_classify_speech (two voices alternate, questions found, no face)", async () => {
+      const r = await tool("pr_classify_speech", { transcript: ivTx, project: projA });
+      assert(r.speakerCount === 2, "two speakers found, got " + r.speakerCount + " " + JSON.stringify(r.clustering));
+      assert(r.speakers.S1.share > 0.6 && r.speakers.S2.turns === 3 && r.speakers.S2.questions === 3 && r.speakers.S1.questions === 0, "S1 answers (most talk), S2 asks three questions: " + JSON.stringify(r.speakers));
+      // every segment's centre must fall inside one scripted turn and carry that voice's label (Daniel = S2, Samantha = S1)
+      const wrong = r.segments.filter((s) => { const c = (s.start + s.end) / 2, t = interviewTurns.find((t) => c >= t.from - 0.3 && c <= t.to + 0.3); return !t || (t.voice === "Daniel" ? "S2" : "S1") !== s.speaker; });
+      assert(wrong.length === 0, "segments mislabelled: " + JSON.stringify(wrong.map((s) => [s.start, s.speaker, s.text.slice(0, 30)])));
+      assert(r.gaze.faces === 0 && r.segments.every((s) => s.gaze === "none") && /no face/.test(r.gaze.hint), "colour card: no face, gaze none, hint present");
+      assert(r.transcript.endsWith("-classified.json") && (await fs.stat(r.transcript)).size > 1000, "classified JSON written next to the original");
+      return { speakers: r.speakers, timing: r.timing, segments: r.segments.map((s) => [s.start, s.speaker, s.gaze]) };
+    });
+    if (cls) await step("pr_cut_by_transcript speakers: [S2] (mark_only, then cut with keep_tracks: a bed on A2 stays)", async () => {
+      const classified = ivTx.replace(/\.json$/, "-classified.json");
+      const expected = interviewTurns.filter((t) => t.voice === "Daniel").reduce((s, t) => s + (t.to - t.from), 0);
+      try { await tool("pr_cut_by_transcript", { sequence: ivSeq, transcript: ivTx, speakers: ["S2"], dry_run: true, project: projA }); throw new Error("not refused"); } catch (e) { assert(/pr_classify_speech/.test(e.message), "plain transcript refused for speakers: " + e.message); }
+      try { await tool("pr_cut_by_transcript", { sequence: ivSeq, transcript: classified, speakers: ["S9"], dry_run: true, project: projA }); throw new Error("not refused"); } catch (e) { assert(/not in this transcript/.test(e.message), "unknown speaker refused: " + e.message); }
+      const d = await tool("pr_cut_by_transcript", { sequence: ivSeq, transcript: classified, speakers: ["S2"], dry_run: true, project: projA });
+      assert(d.count === 3 && d.spans.every((s) => /^S2\/none: /.test(s.words[0])) && Math.abs(d.removedSeconds - expected) < 0.8, `three S2 spans ≈ ${expected.toFixed(1)} s: ` + JSON.stringify(d.spans.map((s) => [s.from.seconds, s.to.seconds, s.words[0].slice(0, 20)])));
+      const g = await tool("pr_cut_by_transcript", { sequence: ivSeq, transcript: classified, gaze: "lens", dry_run: true, project: projA }); assert(g.spans.length === 0, "no lens segments on a colour card");
+      const ab = await tool("pr_cut_by_transcript", { sequence: ivSeq, transcript: classified, speakers: ["S2"], absorb_pauses: true, dry_run: true, project: projA }); assert(ab.removedSeconds > d.removedSeconds + 1 && ab.removedSeconds < d.removedSeconds + 4, "absorb_pauses widens each span by up to 0.75 s a side: " + ab.removedSeconds);
+      // a tone bed on a new audio track, kept uncut through the speaker cut
+      if (tone) { const toneId = (await tool("pr_list_items", { filter: "tone.mp4", project: projA })).items[0].id; await tool("pr_add_tracks", { sequence: ivSeq, audio: 1, project: projA }); const aIdx = (await tool("pr_get_sequence", { sequence: ivSeq, clips: false, project: projA })).tracks.filter((t) => t.type === "audio").length - 1; await tool("pr_place_clip", { sequence: ivSeq, item: toneId, track_type: "audio", track_index: aIdx, start_frame: 0, audio_only: true, project: projA }); }
+      const g0 = await tool("pr_get_sequence", { sequence: ivSeq, project: projA }); const aTracks = g0.tracks.filter((t) => t.type === "audio"), aIdx = aTracks.length - 1, bed = tone ? "A" + (aIdx + 1) : null;
+      const bedBefore = aTracks[aIdx].clips.map((c) => [c.start.frames, c.end.frames, c.inPoint.frames]);
+      const m = await tool("pr_cut_by_transcript", { sequence: ivSeq, transcript: classified, speakers: ["S2"], keep_tracks: bed ? [bed] : undefined, mark_only: true, project: projA }); assert(m.marked === 3, "three markers");
+      const mk = await tool("pr_list_markers", { sequence: ivSeq, project: projA }); assert(mk.markers.length === 3 && mk.markers.every((x) => /^cut: S2\//.test(x.name)) && mk.markers.every((x, i) => Math.abs(x.start.seconds - d.spans[i].from.seconds) < 0.05), "markers sit on the interviewer's lines: " + JSON.stringify(mk.markers.map((x) => [x.start.seconds, x.name.slice(0, 30)])));
+      await tool("pr_remove_markers", { sequence: ivSeq, all: true, project: projA });
+      const endBefore = g0.end.seconds;
+      const r = await tool("pr_cut_by_transcript", { sequence: ivSeq, transcript: classified, speakers: ["S2"], keep_tracks: bed ? [bed] : undefined, project: projA });
+      assert(r.spans.length === 3 && r.spans.every((s) => s.clipsRemoved === 2) && r.gapsClosed.every((x) => !x.notMoved), "each interviewer span removed video + audio and closed: " + JSON.stringify(r.spans.map((s) => s.clipsRemoved)));
+      const g2 = await tool("pr_get_sequence", { sequence: ivSeq, project: projA });
+      const v = g2.tracks.find((t) => t.type === "video" && t.index === 0).clips, total = v.reduce((s, c) => s + (c.end.seconds - c.start.seconds), 0);
+      assert(v.length === 3 && Math.abs(total - (endBefore - r.removedSeconds)) < 0.1 && Math.abs(v[0].end.seconds - v[1].start.seconds) < 1 / 60, "three answer clips left, contiguous, " + total.toFixed(2) + " s");
+      if (bed) { const bedAfter = g2.tracks.filter((t) => t.type === "audio")[aIdx].clips.map((c) => [c.start.frames, c.end.frames, c.inPoint.frames]); assert(JSON.stringify(bedAfter) === JSON.stringify(bedBefore), "bed untouched: " + JSON.stringify([bedBefore, bedAfter])); }
+      const re = await tool("pr_transcribe", { sequence: ivSeq, audio_tracks: [0], language: "en", project: projA }); assert(!/tell me|boards usually|only just starting/i.test(re.text) && /insurance|surprised|assets/i.test(re.text), "the questions are gone, the answers remain: " + re.text.slice(0, 120));
+      return { removed: r.removedSeconds, expected: +expected.toFixed(2), clipsLeft: v.length, bed };
+    });
+    if (cls && (await fs.stat(talkingHead).catch(() => null))) await step("pr_classify_speech gaze on real talking-head footage (one speaker, mostly lens)", async () => {
+      const copy = path.join(dir, "talking-head.mp4"); await fs.copyFile(talkingHead, copy);
+      const tx = await tool("pr_transcribe", { item: copy, language: "en", project: projA });
+      const r = await tool("pr_classify_speech", { transcript: tx.transcript, step_seconds: 1, project: projA });
+      assert(r.speakerCount === 1, "one speaker, got " + r.speakerCount);
+      assert(r.gaze.faces > r.gaze.samples * 0.8 && r.gaze.lensShareOverall >= 0.8 && Math.abs(r.gaze.distribution.yaw.p50) < 10, "mostly on-lens: " + JSON.stringify(r.gaze));
+      const lens = r.segments.filter((s) => s.gaze === "lens").length; assert(lens >= r.segments.length * 0.8, `${lens}/${r.segments.length} segments lens`);
+      return { lensShare: r.gaze.lensShareOverall, yaw: r.gaze.distribution.yaw, segments: r.segments.length, timing: r.timing };
+    }, { optional: true });
+    await step("pr_remove_sequence interview version", () => tool("pr_remove_sequence", { sequence: ivSeq, project: projA }));
   }
 
   // colour, export recipes, rough cut

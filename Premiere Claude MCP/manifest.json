@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "premiere-bridge",
   "display_name": "Premiere Pro Bridge",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "description": "Let Claude drive Adobe Premiere Pro: projects, imports (incl. Dynamic Link AE comps), sequences, clips, tracks, frames and renders.",
   "long_description": "Needs the Claude Bridge CEP panel installed in Premiere Pro (Window \u203a Extensions \u203a Claude Bridge). The panel runs a localhost-only HTTP server inside Premiere; this MCP server talks to it. Nothing is saved unless Claude calls pr_save_project / pr_save_as.",
   "author": {

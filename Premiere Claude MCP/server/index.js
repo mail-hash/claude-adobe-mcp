@@ -37,7 +37,9 @@ source time, the bridge converts). Transitions: pr_list_transitions / pr_add_tra
 pr_trim_clip moves clip edges keeping content in place, pr_move_clip to_track_index moves across tracks. Clip speed is not
 settable through Premiere 26.5's API.
 Transcript: pr_transcribe (local mlx_whisper, word timings) then pr_cut_by_transcript (fillers / words / phrases / ranges, razor + remove +
-close gaps). Audio: pr_analyze_audio (LUFS, peaks, silences), pr_set_clip_volume (dB, keyframes), pr_duck_audio. Graphics:
+close gaps). pr_classify_speech labels a transcript with who speaks (S1, S2… by talk time, with question counts) and where the on-screen
+person looks (lens / away per segment); then pr_cut_by_transcript { speakers: ["S2"] } or { gaze: "away" } removes those segments
+("delete the parts where the interviewer talks": classify, name the interviewer from the totals, cut with mark_only first). Audio: pr_analyze_audio (LUFS, peaks, silences), pr_set_clip_volume (dB, keyframes), pr_duck_audio. Graphics:
 pr_list_mogrts / pr_add_graphic / pr_get_graphic_text / pr_set_graphic_text.
 Colour: pr_color_correct (Lumetri controls by name), pr_measure_color, pr_match_color. Delivery: pr_export_recipe (youtube_4k, vertical_9x16 with
 Auto Reframe, prores_master, podcast_mp3…, verified with ffprobe). Start from footage: pr_rough_cut (folder → import, shots, assembly, markers).
@@ -46,7 +48,7 @@ pr_fade (opacity + audio fades). pr_sync_clips (waveform sync, stack cameras). p
 pr_run_script runs raw ExtendScript with helpers: getProject(nameOrPath), getSequence(project, nameOrId), findItem(ref),
 findBin(path, create), qeSequence(seq), makeTime(sec), timeInfo(t, seq), log(...) (collected into "output").`;
 
-const server = new McpServer({ name: "premiere-bridge", version: "1.9.0" }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: "premiere-bridge", version: "1.11.0" }, { instructions: INSTRUCTIONS });
 const text = (s) => ({ content: [{ type: "text", text: typeof s === "string" ? s : JSON.stringify(s, null, 1) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: String(e?.message ?? e) + (e?.detail ? "\n" + JSON.stringify(e.detail, null, 1) : "") }] });
 const tool = (name, def, fn) => server.registerTool(name, def, async (args) => { try { return await fn(args); } catch (e) { return fail(e); } });
@@ -419,6 +421,17 @@ async function sequenceWav(sequence, project, { inSeconds, outSeconds } = {}) {
   if (!(await fs.stat(file).catch(() => null))) throw new Error("Premiere did not write the sequence audio: " + JSON.stringify(r).slice(0, 300));
   return { wav: file, render: r };
 }
+// Render a sequence's audio with only the wanted audio tracks audible: the others are muted for the render and restored after.
+async function soloSequenceWav(seqInfo, project, audioTracks, { inSeconds, outSeconds } = {}) {
+  const muted = [];
+  if (audioTracks?.length) {
+    const want = new Set(audioTracks);
+    for (const i of want) if (!seqInfo.tracks.some((t) => t.type === "audio" && t.index === i)) throw new Error(`audio track ${i} not found`);
+    for (const t of seqInfo.tracks.filter((t) => t.type === "audio")) if (!want.has(t.index)) { if (t.enabled === false) continue; await call("trackOp", { sequence: seqInfo.id, trackType: "audio", trackIndex: t.index, enabled: false, project }, { timeoutMs: 60000 }); muted.push(t.index); }
+  }
+  try { return await sequenceWav(seqInfo.id, project, { inSeconds, outSeconds }); }
+  finally { for (const i of muted) await call("trackOp", { sequence: seqInfo.id, trackType: "audio", trackIndex: i, enabled: true, project }, { timeoutMs: 60000 }).catch(() => {}); }
+}
 async function to16kWav(src) {
   const ff = await ffmpegPath(); if (!ff) throw new Error("ffmpeg not found (brew install ffmpeg)");
   const dir = path.join(SUPPORT_DIR, "audio"); await fs.mkdir(dir, { recursive: true });
@@ -438,17 +451,7 @@ tool("pr_transcribe", {
   let src, mode, item = null, seqInfo = null, fps = 30;
   if (a.sequence || !a.item) { seqInfo = await call("getSequence", { sequence: a.sequence, clips: !!a.item, project: a.project }, { timeoutMs: 120000 }); fps = seqInfo.fps || 30; }
   if (a.item) { const m = await resolveMediaRef(a.item, a.project); src = m.mediaPath; item = m.item; mode = "media"; if (!seqInfo) { try { const pr = await run(await ffprobePath(), ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", src]); const [n, d] = pr.stdout.trim().split("/").map(Number); if (n && d) fps = n / d; } catch {} } }
-  else {
-    // solo the wanted audio tracks for the render: mute the others, restore whatever state they had afterwards
-    const muted = [];
-    if (a.audio_tracks?.length) {
-      const want = new Set(a.audio_tracks);
-      for (const t of seqInfo.tracks.filter((t) => t.type === "audio")) if (!want.has(t.index)) { if (t.enabled === false) continue; await call("trackOp", { sequence: seqInfo.id, trackType: "audio", trackIndex: t.index, enabled: false, project: a.project }, { timeoutMs: 60000 }); muted.push(t.index); }
-      for (const i of want) if (!seqInfo.tracks.some((t) => t.type === "audio" && t.index === i)) throw new Error(`audio track ${i} not found`);
-    }
-    try { const r = await sequenceWav(seqInfo.id, a.project, { inSeconds: a.in_seconds, outSeconds: a.out_seconds }); src = r.wav; mode = "sequence"; }
-    finally { for (const i of muted) await call("trackOp", { sequence: seqInfo.id, trackType: "audio", trackIndex: i, enabled: true, project: a.project }, { timeoutMs: 60000 }).catch(() => {}); }
-  }
+  else { src = (await soloSequenceWav(seqInfo, a.project, a.audio_tracks, { inSeconds: a.in_seconds, outSeconds: a.out_seconds })).wav; mode = "sequence"; }
   const wav = await to16kWav(src);
   const outDir = path.join(SUPPORT_DIR, "transcripts"); await fs.mkdir(outDir, { recursive: true });
   const model = a.model ? (a.model.includes("/") ? a.model : `mlx-community/${a.model.startsWith("whisper-") ? a.model : "whisper-" + a.model}${/-mlx$/.test(a.model) ? "" : "-mlx"}`) : "mlx-community/whisper-base-mlx";
@@ -470,7 +473,7 @@ tool("pr_transcribe", {
     words.push(rec);
   }
   const segments = (raw.segments || []).map((s) => ({ start: tInfo(s.start + offset, fps), end: tInfo(s.end + offset, fps), text: String(s.text).trim() }));
-  const transcript = { source: src, mode, sequence: seqInfo ? { id: seqInfo.id, name: seqInfo.name } : null, item: item ? { id: item.id, name: item.name } : null, fps, language: raw.language, model, placements, text: String(raw.text || "").trim(), segments, words, created: new Date().toISOString() };
+  const transcript = { source: src, mode, sequence: seqInfo ? { id: seqInfo.id, name: seqInfo.name } : null, item: item ? { id: item.id, name: item.name } : null, fps, language: raw.language, model, placements, audioTracks: mode === "sequence" ? a.audio_tracks : undefined, inSeconds: mode === "sequence" ? a.in_seconds : undefined, outSeconds: mode === "sequence" ? a.out_seconds : undefined, text: String(raw.text || "").trim(), segments, words, created: new Date().toISOString() };
   const jsonPath = path.join(outDir, `${(seqInfo?.name || item?.name || path.basename(src)).replace(/[^\w.-]+/g, "_")}-${Date.now()}.json`);
   await fs.writeFile(jsonPath, JSON.stringify(transcript, null, 1));
   const maxWords = a.max_words ?? 400;
@@ -510,13 +513,34 @@ function mergeRanges(ranges, pad = 0, minGap = 0.04) {
 
 tool("pr_cut_by_transcript", {
   title: "Cut by transcript",
-  description: `Remove parts of a sequence based on a transcript from pr_transcribe (sequence mode): fillers: true removes um/uh/erm… (or give words: [...] to match, case-insensitive; phrases allowed), phrases: ["exact text to find"] removes every occurrence, ranges: [{from_seconds, to_seconds}] removes those spans, and word_ranges: [{from_word, to_word}] uses word indexes from the transcript. Ranges are padded (padding_ms, default 40), merged, then each span is razored on every track and removed with ripple (later material shifts left), last span first. keep_tracks: ["audio 1"] leaves a music bed (or any track) uncut and in place: it is neither razored nor shortened, so a bed that spans the cut keeps playing continuously while the dialogue tightens on top of it. dry_run lists the spans with their words. Markers can be added instead of cutting (mark_only: true).`,
-  inputSchema: { sequence: Seq, transcript: z.string().describe("path returned by pr_transcribe"), keep_tracks: z.array(z.string()).optional().describe('tracks to leave untouched, as "audio 1" / "A2" / "video 2" / "V3" (A/V numbering is 1-based like the timeline)'), fillers: z.boolean().optional(), words: z.array(z.string()).optional(), phrases: z.array(z.string()).optional(), ranges: z.array(z.object({ from_seconds: z.number(), to_seconds: z.number() })).optional(), word_ranges: z.array(z.object({ from_word: z.number().int(), to_word: z.number().int() })).optional(), padding_ms: z.number().optional(), min_confidence: z.number().optional().describe("skip filler matches below this probability (default 0)"), mark_only: z.boolean().optional(), project: Project, dry_run: DryRun },
+  description: `Remove parts of a sequence based on a transcript from pr_transcribe (sequence mode): fillers: true removes um/uh/erm… (or give words: [...] to match, case-insensitive; phrases allowed), phrases: ["exact text to find"] removes every occurrence, ranges: [{from_seconds, to_seconds}] removes those spans, and word_ranges: [{from_word, to_word}] uses word indexes from the transcript. With a transcript from pr_classify_speech (the -classified.json): speakers: ["S2"] removes every segment spoken by those speakers (the interviewer's questions), gaze: "away" (or ["away", "mixed"]) removes the segments where the on-screen person looks off-lens; both together intersect; absorb_pauses: true extends those segments into half of the silence on either side (up to 0.75 s) so the join is tighter. Ranges are padded (padding_ms, default 40), merged, then each span is razored on every track and removed with ripple (later material shifts left), last span first. keep_tracks: ["audio 1"] leaves a music bed (or any track) uncut and in place: it is neither razored nor shortened, so a bed that spans the cut keeps playing continuously while the dialogue tightens on top of it. dry_run lists the spans with their words. Markers can be added instead of cutting (mark_only: true).`,
+  inputSchema: { sequence: Seq, transcript: z.string().describe("path returned by pr_transcribe (or the -classified.json from pr_classify_speech for speakers / gaze)"), keep_tracks: z.array(z.string()).optional().describe('tracks to leave untouched, as "audio 1" / "A2" / "video 2" / "V3" (A/V numbering is 1-based like the timeline)'), fillers: z.boolean().optional(), words: z.array(z.string()).optional(), phrases: z.array(z.string()).optional(), ranges: z.array(z.object({ from_seconds: z.number(), to_seconds: z.number() })).optional(), word_ranges: z.array(z.object({ from_word: z.number().int(), to_word: z.number().int() })).optional(), speakers: z.array(z.string()).optional().describe('speaker labels from pr_classify_speech, e.g. ["S2"]'), gaze: z.union([z.string(), z.array(z.string())]).optional().describe("lens | away | mixed | none, one or several"), absorb_pauses: z.boolean().optional(), padding_ms: z.number().optional(), min_confidence: z.number().optional().describe("skip filler matches below this probability (default 0)"), mark_only: z.boolean().optional(), project: Project, dry_run: DryRun },
 }, async (a) => {
   const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
   const seqInfo = await call("getSequence", { sequence: a.sequence, clips: false, project: a.project }, { timeoutMs: 120000 });
   const fps = seqInfo.fps || tr.fps || 30, words = sequenceWords(tr, "cut by it"), norm = (s) => String(s).toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, "").trim();
   const spans = [];
+  const gazeWanted = a.gaze === undefined ? [] : [].concat(a.gaze);
+  if (a.speakers?.length || gazeWanted.length) {
+    if (!tr.turns || !words.some((w) => w.turn !== undefined)) throw new Error("this transcript has no speaker / gaze labels: run pr_classify_speech on it first and pass the -classified.json it writes");
+    const known = Object.keys(tr.speakers || {}), unknown = (a.speakers || []).filter((s) => !known.includes(s));
+    if (unknown.length) throw new Error(`speaker(s) ${unknown.join(", ")} not in this transcript (it has ${known.join(", ")})`);
+    const badGaze = gazeWanted.filter((g) => !["lens", "away", "mixed", "none"].includes(g)); if (badGaze.length) throw new Error(`gaze must be lens | away | mixed | none, not ${badGaze.join(", ")}`);
+    if (gazeWanted.length && !words.some((w) => w.gaze)) throw new Error("this transcript has no gaze labels (pr_classify_speech ran with gaze: false or found no video)");
+    const wantS = new Set(a.speakers || []), wantG = new Set(gazeWanted);
+    const byTurn = new Map();
+    words.forEach((w, i) => { if ((!wantS.size || wantS.has(w.speaker)) && (!wantG.size || wantG.has(w.gaze))) { const g = byTurn.get(w.turn) || []; g.push(i); byTurn.set(w.turn, g); } });
+    for (const idx of byTurn.values()) {
+      const ws = idx.map((i) => words[i]);
+      let from = ws[0].start.seconds, to = ws[ws.length - 1].end.seconds;
+      if (a.absorb_pauses) {
+        const prev = words[idx[0] - 1], next = words[idx[idx.length - 1] + 1];
+        if (prev) from = Math.max(prev.end.seconds, from - Math.min(0.75, (from - prev.end.seconds) / 2)); else from = Math.max(0, from - 0.75);
+        if (next) to = Math.min(next.start.seconds, to + Math.min(0.75, (next.start.seconds - to) / 2)); else to += 0.75;
+      }
+      spans.push({ from, to, labels: [`${ws[0].speaker}${ws[0].gaze ? "/" + ws[0].gaze : ""}: ${ws.map((w) => w.word).join(" ").slice(0, 70)}`] });
+    }
+  }
   const matchList = [...(a.fillers ? DEFAULT_FILLERS : []), ...(a.words || [])].map(norm).filter(Boolean);
   if (matchList.length) {
     for (let i = 0; i < words.length; i++) {
@@ -566,6 +590,111 @@ tool("pr_cut_by_transcript", {
   }
   const final = await call("getSequence", { sequence: seqInfo.id, clips: false, project: a.project }, { timeoutMs: 60000 });
   return text({ sequence: final.name, spans: results.reverse(), removedSeconds: +removedTotal.toFixed(3), keptTracks: keep.length ? keep.map((k) => k.type + " " + k.index) : undefined, gapsClosed: closed.reverse(), end: final.end, note: "Transcript times are now stale for the removed spans; re-run pr_transcribe before cutting again." });
+});
+
+// ---- who is speaking and where they look: speaker diarization (ECAPA embeddings) + head pose / iris (MediaPipe), both local through uv
+async function runUvScript(deps, script, args, { timeout = 3600000 } = {}) {
+  const uv = await uvPath(); if (!uv) throw new Error("uv not found (needed to run the Python models): curl -LsSf https://astral.sh/uv/install.sh | sh");
+  const uvArgs = ["run", "--python", "3.12", "--no-project"]; for (const d of deps) uvArgs.push("--with", d);
+  uvArgs.push("python", path.join(SCRIPTS_DIR, script), ...args);
+  let r;
+  try { r = await run(uv, uvArgs, { timeout, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, PATH: `${path.join(os.homedir(), ".local", "bin")}:/opt/homebrew/bin:${process.env.PATH || ""}`, HF_HUB_DISABLE_PROGRESS_BARS: "1", PYTHONWARNINGS: "ignore" } }); }
+  catch (e) { throw new Error(`${script} failed: ` + String(e.stderr || e.message).split("\n").filter((l) => !/^[WI]0000|XNNPACK|unauthenticated/.test(l)).join("\n").slice(-1200)); }
+  const line = r.stdout.trim().split("\n").filter((l) => l.startsWith("{")).pop();
+  if (!line) throw new Error(`${script} printed no result: ` + String(r.stderr || "").slice(-600));
+  return JSON.parse(line);
+}
+async function findRecipePreset(rc) {
+  for (const frag of rc.preset) { const m = await findPresets(frag); const exact = m.filter((p) => path.basename(p, ".epr").toLowerCase() === frag.toLowerCase()); if (exact.length) return exact[0]; if (m.length === 1) return m[0]; }
+  throw new Error(`no export preset found (tried ${rc.preset.join(", ")}); see pr_list_export_presets`);
+}
+// Picture of a whole sequence for frame analysis: a 720p H.264 render in direct mode.
+async function sequenceVideo(sequence, project) {
+  const presetPath = await findRecipePreset(RECIPES.youtube_720);
+  const dir = path.join(SUPPORT_DIR, "video"); await fs.mkdir(dir, { recursive: true });
+  const out = path.join(dir, `seq-${Date.now()}.mp4`);
+  const r = await call("render", { sequence, presetPath, path: out, mode: "direct", range: "entire", project }, { timeoutMs: 3600000 });
+  const file = r.path || out;
+  if (!(await fs.stat(file).catch(() => null))) throw new Error("Premiere did not write the sequence video: " + JSON.stringify(r).slice(0, 300));
+  return file;
+}
+async function hasVideoStream(file) { try { const r = await run(await ffprobePath(), ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", file]); return /video/.test(r.stdout); } catch { return false; } }
+
+tool("pr_classify_speech", {
+  title: "Classify speech (who speaks, where they look)",
+  description: `Label a pr_transcribe transcript with WHO is speaking and WHERE the on-screen person is looking, so the interviewer's lines (or every off-lens aside) can be cut with pr_cut_by_transcript { speakers: ["S2"] } / { gaze: "away" }. Speakers: ECAPA-TDNN speaker embeddings (speechbrain, public model, no token) on 1.5 s windows over the speech, clustered (agglomerative, cosine) into S1, S2… ordered by talk time; every word and segment gets a speaker, plus per-speaker totals (seconds, share, turns, questions) to name them ("S2 talks 12 % of the time, mostly questions"). Give speakers: N when you know how many voices there are (more reliable than the auto threshold, which separates clearly different voices but can split two similar ones). Gaze: frames every step_seconds (0.5) from the media file (media-mode transcript) or a 720p render of the sequence, MediaPipe Face Landmarker head yaw / pitch / roll + iris offset per sample; on-lens = |yaw| ≤ yaw_threshold (20°) and |pitch| ≤ pitch_threshold (20°) and |eye| ≤ eye_threshold; each segment becomes gaze: lens | away | mixed | none (no face) by its share of on-lens samples (lens_share, 0.7). The yaw/pitch distribution is reported so you can calibrate: a documentary interview sits off-lens the whole time (yaw 20–40°), which is normal for that style, not a cut. Writes <transcript>-classified.json next to the original (words carry speaker + gaze + turn; turns: [...]) and returns the segments compactly: start/end seconds + timecode, speaker, gaze, word index range, text. Everything runs locally through uv (first run downloads ~1 GB of torch + the models).`,
+  inputSchema: { transcript: z.string().describe("transcript JSON path from pr_transcribe"), speakers: z.number().int().optional().describe("number of voices, when known"), min_speakers: z.number().int().optional(), max_speakers: z.number().int().optional().describe("default 6"), speaker_threshold: z.number().optional().describe("cosine distance to split clusters in auto mode (default 0.55; lower = more speakers)"), gaze: z.boolean().optional().describe("default true; false skips the frame analysis"), video: z.string().optional().describe("video file to sample instead of the transcript's media / a sequence render"), step_seconds: z.number().optional(), yaw_threshold: z.number().optional(), pitch_threshold: z.number().optional(), eye_threshold: z.number().optional().describe("iris offset, 0..1 (default 0.35)"), lens_share: z.number().optional().describe("share of on-lens samples for a segment to be 'lens' (default 0.7); below 1 − lens_share it is 'away'"), max_segments: z.number().int().optional().describe("segments to include inline (default 300)"), project: Project },
+}, async (a) => {
+  const tr = JSON.parse(await fs.readFile(a.transcript, "utf8"));
+  if (!tr.words?.length) throw new Error("the transcript has no words");
+  const fps = tr.fps || 30, t0 = Date.now(), timing = {};
+  // audio in the transcript's own time base: the rendered sequence WAV or the media file it was made from
+  let src = tr.source, seqInfo = null;
+  if (!(await fs.stat(src).catch(() => null))) {
+    if (tr.mode !== "sequence" || !tr.sequence) throw new Error(`the transcript's source ${src} no longer exists; re-run pr_transcribe`);
+    seqInfo = await call("getSequence", { sequence: tr.sequence.id, clips: false, project: a.project }, { timeoutMs: 120000 });
+    src = (await soloSequenceWav(seqInfo, a.project, tr.audioTracks, { inSeconds: tr.inSeconds, outSeconds: tr.outSeconds })).wav;
+  }
+  const wav = await to16kWav(src);
+  const dArgs = [a.transcript, wav];
+  if (a.speakers) dArgs.push(`--speakers=${a.speakers}`); if (a.min_speakers) dArgs.push(`--min-speakers=${a.min_speakers}`); if (a.max_speakers) dArgs.push(`--max-speakers=${a.max_speakers}`); if (a.speaker_threshold) dArgs.push(`--threshold=${a.speaker_threshold}`);
+  if (tr.mode === "sequence" && tr.inSeconds) dArgs.push(`--offset=${tr.inSeconds}`);
+  const dz = await runUvScript(["torch", "torchaudio", "speechbrain", "scikit-learn", "numpy"], "diarize.py", dArgs);
+  timing.speakers = +((Date.now() - t0) / 1000).toFixed(1);
+  const words = tr.words.map((w, i) => ({ ...w, speaker: dz.wordSpeakers[i]?.speaker, speakerConfidence: dz.wordSpeakers[i]?.confidence }));
+  // gaze samples from the picture
+  let gz = null, videoPath = a.video || null, gazeNote;
+  if (a.gaze !== false) {
+    const t1 = Date.now();
+    if (!videoPath) {
+      if (tr.mode === "media") videoPath = tr.source;
+      else { if (!tr.sequence) throw new Error("no sequence in the transcript to render for gaze (pass video:)"); videoPath = await sequenceVideo(tr.sequence.id, a.project); }
+    }
+    if (!(await hasVideoStream(videoPath))) { gazeNote = `${videoPath} has no video stream: gaze skipped`; videoPath = null; }
+    else {
+      const ff = await ffmpegPath(); if (!ff) throw new Error("ffmpeg not found (brew install ffmpeg)");
+      const first = words[0].start.seconds, last = words[words.length - 1].end.seconds;
+      const gArgs = [videoPath, `--ffmpeg=${ff}`, `--step=${a.step_seconds ?? 0.5}`, `--start=${Math.max(0, first - 1).toFixed(2)}`, `--end=${(last + 1).toFixed(2)}`, `--yaw=${a.yaw_threshold ?? 20}`, `--pitch=${a.pitch_threshold ?? 20}`, `--eye=${a.eye_threshold ?? 0.35}`];
+      gz = await runUvScript(["mediapipe", "numpy"], "gaze.py", gArgs);
+      timing.gaze = +((Date.now() - t1) / 1000).toFixed(1);
+    }
+  }
+  // turns: split the words at speaker changes, at the transcript's own segment boundaries and at pauses over 1.5 s
+  const segs = tr.segments || []; let si = 0;
+  const turns = []; let cur = null;
+  words.forEach((w, i) => {
+    while (si < segs.length - 1 && w.start.seconds >= segs[si].end.seconds - 1e-3) si++;
+    const brk = !cur || w.speaker !== cur.speaker || si !== cur.seg || w.start.seconds - cur.end > 1.5;
+    if (brk) { cur = { index: turns.length, start: w.start.seconds, end: w.end.seconds, speaker: w.speaker, seg: si, i0: i, i1: i, text: [] }; turns.push(cur); }
+    cur.end = w.end.seconds; cur.i1 = i; cur.text.push(w.word);
+  });
+  const lensShare = a.lens_share ?? 0.7;
+  const samples = gz?.samples || [];
+  for (const t of turns) {
+    t.text = t.text.join(" ");
+    if (gz) {
+      let inside = samples.filter((s) => s[0] >= t.start - 1e-6 && s[0] <= t.end + 1e-6);
+      if (!inside.length && samples.length) { const c = (t.start + t.end) / 2; inside = [samples.reduce((b, s) => (Math.abs(s[0] - c) < Math.abs(b[0] - c) ? s : b))]; }
+      const faces = inside.filter((s) => s[6] >= 0), lens = faces.filter((s) => s[6] === 1).length;
+      const share = faces.length ? lens / faces.length : null;
+      t.gaze = !faces.length ? "none" : share >= lensShare ? "lens" : share <= 1 - lensShare ? "away" : "mixed";
+      t.lensShare = share === null ? null : +share.toFixed(2);
+      if (faces.length) { t.yaw = +(faces.reduce((s, f) => s + f[1], 0) / faces.length).toFixed(1); t.pitch = +(faces.reduce((s, f) => s + f[2], 0) / faces.length).toFixed(1); }
+    }
+    for (let i = t.i0; i <= t.i1; i++) { words[i].turn = t.index; if (gz) words[i].gaze = t.gaze; }
+  }
+  // per-speaker totals, with how many of their turns are questions (helps name the interviewer)
+  const speakers = {};
+  for (const [name, v] of Object.entries(dz.speakers || {})) { const mine = turns.filter((t) => t.speaker === name); speakers[name] = { ...v, questions: mine.filter((t) => /\?\s*$/.test(t.text)).length, gaze: gz ? Object.fromEntries(["lens", "away", "mixed", "none"].map((g) => [g, mine.filter((t) => t.gaze === g).length]).filter(([, n]) => n)) : undefined, firstWords: mine[0] ? mine[0].text.split(" ").slice(0, 10).join(" ") : undefined }; }
+  const gazeSummary = gz ? { video: videoPath, step: gz.step, samples: gz.count, faces: gz.faces, lens: gz.lens, away: gz.away, lensShareOverall: gz.faces ? +(gz.lens / gz.faces).toFixed(2) : null, thresholds: { ...gz.thresholds, lensShare }, distribution: gz.distribution, segments: Object.fromEntries(["lens", "away", "mixed", "none"].map((g) => [g, turns.filter((t) => t.gaze === g).length])) } : undefined;
+  if (gz && gz.faces && gz.away / gz.faces > 0.8) gazeSummary.hint = `${Math.round((100 * gz.away) / gz.faces)} % of the samples are off-lens (median yaw ${gz.distribution.yaw.p50}°): for an interview shot past the camera that is the normal eyeline, not a problem; raise yaw_threshold / pitch_threshold (or pass video: of another angle) if you want 'away' to mean something else.`;
+  if (gz && !gz.faces) gazeSummary.hint = "no face found in any sampled frame (graphics, wide shot, or the wrong video); gaze is 'none' for every segment";
+  const enriched = { ...tr, words, turns: turns.map(({ seg, ...t }) => t), speakers, gaze: gz ? { ...gazeSummary, samples: gz.samples, format: "[t, yaw, pitch, roll, eyeH, eyeV, onLens(1/0/-1 no face), confidence]" } : undefined, classification: { params: { speakers: a.speakers, min_speakers: a.min_speakers, max_speakers: a.max_speakers, speaker_threshold: a.speaker_threshold, step_seconds: a.step_seconds ?? 0.5, yaw_threshold: a.yaw_threshold ?? 20, pitch_threshold: a.pitch_threshold ?? 20, eye_threshold: a.eye_threshold ?? 0.35, lens_share: lensShare }, clustering: dz.clustering, wav, video: videoPath, created: new Date().toISOString() } };
+  const outPath = a.transcript.replace(/(-classified)?\.json$/i, "") + "-classified.json";
+  await fs.writeFile(outPath, JSON.stringify(enriched, null, 1));
+  const maxSeg = a.max_segments ?? 300;
+  const segments = turns.slice(0, maxSeg).map((t) => ({ start: +t.start.toFixed(2), end: +t.end.toFixed(2), timecode: tcOf(t.start, fps), speaker: t.speaker, gaze: t.gaze, lensShare: t.lensShare, yaw: t.yaw, words: [t.i0, t.i1], text: t.text }));
+  return text({ transcript: outPath, mode: tr.mode, fps, speakerCount: Object.keys(speakers).length, speakers, clustering: dz.clustering, gaze: gazeSummary, gazeNote, segments, segmentCount: turns.length, truncated: turns.length > maxSeg ? `showing ${maxSeg} of ${turns.length} segments; the JSON has all` : undefined, timing: { ...timing, total: +((Date.now() - t0) / 1000).toFixed(1) }, next: Object.keys(speakers).length > 1 ? `pr_cut_by_transcript { transcript: "${outPath}", speakers: ["<the interviewer, usually the one with the questions>"] } (or gaze: "away"), with mark_only: true to review first and keep_tracks for a music bed.` : `one voice found; pr_cut_by_transcript { transcript: "${outPath}", gaze: "away" } removes the off-lens segments (pass speakers: 2 to force a split if there really are two voices).` });
 });
 
 tool("pr_analyze_audio", {
